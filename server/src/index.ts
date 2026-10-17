@@ -1,0 +1,326 @@
+import express from "express";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { mcpAuthRouter, getOAuthProtectedResourceMetadataUrl } from "@modelcontextprotocol/sdk/server/auth/router.js";
+import { metadataHandler } from "@modelcontextprotocol/sdk/server/auth/handlers/metadata.js";
+import { Fout, Store, type AdminMelding } from "./store.js";
+import { OAuthOpslag } from "./oauth-opslag.js";
+import { GlobeOAuth, SCOPE } from "./oauth.js";
+import { controleerTotp, controleerWachtwoord } from "./auth.js";
+import { registerTools } from "./tools.js";
+import { toestemmingPagina, foutPagina } from "./pagina.js";
+
+/**
+ * Globe-spiegel.
+ *
+ * - /agent/*  : de Windows-agent op de pc bij Van Dungen Automaten duwt hier
+ *               rijen naartoe (bearer AGENT_TOKEN). De pc zelf is nergens van
+ *               buitenaf bereikbaar.
+ * - /mcp      : leestools voor Claude (OAuth voor claude.ai, of MCP_AUTH_TOKEN).
+ * - /oauth/*  : toestemmingsscherm, beveiligd met wachtwoord + TOTP.
+ *
+ * Er bestaat geen code-pad dat iets naar Globe terugschrijft.
+ */
+
+function vereist(naam: string, minLengte = 0): string {
+  const v = process.env[naam];
+  if (!v || v.length < minLengte) {
+    throw new Error(`${naam} ontbreekt of is korter dan ${minLengte} tekens.`);
+  }
+  return v;
+}
+
+const DATABASE_URL = vereist("DATABASE_URL");
+const AGENT_TOKEN = vereist("AGENT_TOKEN", 32);
+const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN && process.env.MCP_AUTH_TOKEN.length >= 32 ? process.env.MCP_AUTH_TOKEN : null;
+const PUBLIC_URL = process.env.PUBLIC_URL?.replace(/\/+$/, "") ?? (process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : undefined);
+const TOTP_SECRET = process.env.TOTP_SECRET;
+const AUTH_PASSWORD_HASH = process.env.AUTH_PASSWORD_HASH;
+const AFSCHERM = new RegExp(process.env.AFSCHERM_PATROON ?? "pensioen", "i");
+
+/** Vergelijking in constante tijd, ongeacht lengte. */
+function tokenGelijk(gegeven: string, verwacht: string): boolean {
+  const a = createHash("sha256").update(gegeven).digest();
+  const b = createHash("sha256").update(verwacht).digest();
+  return timingSafeEqual(a, b);
+}
+
+function bearer(req: express.Request): string {
+  const h = req.header("authorization") ?? "";
+  return /^bearer /i.test(h) ? h.slice(7).trim() : "";
+}
+
+const OVERSLAAN = process.env.OVERSLAAN_TABELLEN ? new RegExp(process.env.OVERSLAAN_TABELLEN, "i") : null;
+const store = new Store(DATABASE_URL, AFSCHERM, OVERSLAAN);
+await store.migrate();
+
+const app = express();
+app.set("trust proxy", 1);
+app.disable("x-powered-by");
+
+app.get("/health", (_req, res) => {
+  res.json({ ok: true, service: "globe-spiegel" });
+});
+
+/* ------------------------------------------------------------------ agent */
+
+const agent = express.Router();
+// Ruime limiet: de agent stuurt blokken van een paar duizend rijen, gzipt.
+agent.use(express.json({ limit: "64mb", inflate: true }));
+agent.use((req, res, next) => {
+  if (!tokenGelijk(bearer(req), AGENT_TOKEN)) {
+    res.status(401).json({ fout: "Ongeldige agent-token." });
+    return;
+  }
+  next();
+});
+
+const asyncRoute =
+  (fn: (req: express.Request, res: express.Response) => Promise<void>) =>
+  (req: express.Request, res: express.Response) => {
+    fn(req, res).catch((e: unknown) => {
+      const status = e instanceof Fout ? e.status : 500;
+      console.error(`[agent] ${req.path}:`, e);
+      res.status(status).json({ fout: e instanceof Error ? e.message : String(e) });
+    });
+  };
+
+agent.post(
+  "/start",
+  asyncRoute(async (req, res) => {
+    const b = req.body ?? {};
+    if (!Array.isArray(b.admins)) throw new Fout(400, "admins ontbreekt");
+    const r = await store.start(String(b.agent ?? "onbekend"), b.host ?? null, b.versie ?? null, b.admins as AdminMelding[]);
+    console.log(`[agent] run ${r.runId} van ${b.host} (${b.versie}), ${b.admins.length} administratie(s)`);
+    res.json({ run_id: r.runId, toestand: r.toestand, sleutelscan_na_uren: Number(process.env.SLEUTELSCAN_UREN ?? 20) });
+  }),
+);
+
+agent.post(
+  "/rijen",
+  asyncRoute(async (req, res) => {
+    const b = req.body ?? {};
+    if (!b.admin_key || !b.tbl || !Array.isArray(b.rijen)) throw new Fout(400, "admin_key, tbl en rijen zijn verplicht");
+    const r = await store.rijen(String(b.admin_key), String(b.tbl), b.rijen, "watermerk" in b ? b.watermerk : undefined);
+    res.json(r);
+  }),
+);
+
+agent.post(
+  "/sleutels",
+  asyncRoute(async (req, res) => {
+    const b = req.body ?? {};
+    if (!b.scan_id || !b.admin_key || !b.tbl || !Array.isArray(b.sleutels)) {
+      throw new Fout(400, "scan_id, admin_key, tbl en sleutels zijn verplicht");
+    }
+    const r = await store.sleutels(String(b.scan_id), String(b.admin_key), String(b.tbl), b.sleutels.map(String), b.laatste === true);
+    if (r.overgeslagen) console.warn(`[agent] ${b.admin_key}/${b.tbl}: ${r.overgeslagen}`);
+    res.json(r);
+  }),
+);
+
+agent.post(
+  "/einde",
+  asyncRoute(async (req, res) => {
+    const b = req.body ?? {};
+    if (!b.run_id) throw new Fout(400, "run_id ontbreekt");
+    await store.einde(String(b.run_id), b.ok === true, b.detail);
+    console.log(`[agent] run ${b.run_id} klaar, ok=${b.ok === true}`);
+    res.json({ ok: true });
+  }),
+);
+
+agent.get(
+  "/status",
+  asyncRoute(async (_req, res) => {
+    res.json(await store.status());
+  }),
+);
+
+app.use("/agent", agent);
+
+/* ------------------------------------------------------------------ OAuth */
+
+const OAUTH_REDIRECTS = (
+  process.env.OAUTH_REDIRECT_URIS ?? "https://claude.ai/api/mcp/auth_callback,https://claude.com/api/mcp/auth_callback"
+)
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+let oauth: GlobeOAuth | null = null;
+let resourceMetadataUrl: string | null = null;
+
+if (PUBLIC_URL && TOTP_SECRET) {
+  const resourceUrl = new URL("/mcp", PUBLIC_URL);
+  const opslag = new OAuthOpslag(DATABASE_URL);
+  oauth = new GlobeOAuth(opslag, {
+    resourceUrl,
+    coreUrl: new URL(PUBLIC_URL),
+    toegestaneRedirects: OAUTH_REDIRECTS,
+    loopbackToestaan: process.env.OAUTH_LOOPBACK === "1",
+  });
+  resourceMetadataUrl = getOAuthProtectedResourceMetadataUrl(resourceUrl);
+
+  app.use(
+    mcpAuthRouter({
+      provider: oauth,
+      issuerUrl: new URL(PUBLIC_URL),
+      resourceServerUrl: resourceUrl,
+      scopesSupported: [SCOPE],
+      resourceName: "Exact Globe-spiegel (alleen lezen)",
+      clientRegistrationOptions: { clientSecretExpirySeconds: 0 },
+    }),
+  );
+  app.use(
+    "/.well-known/oauth-protected-resource",
+    metadataHandler({
+      resource: resourceUrl.href,
+      authorization_servers: [new URL(PUBLIC_URL).href],
+      scopes_supported: [SCOPE],
+      resource_name: "Exact Globe-spiegel (alleen lezen)",
+    }),
+  );
+
+  // Rem op raden: 5 mislukte pogingen per kwartier per IP.
+  const pogingen = new Map<string, { n: number; tot: number }>();
+  const magProberen = (ip: string) => {
+    const p = pogingen.get(ip);
+    if (!p || p.tot < Date.now()) return true;
+    return p.n < 5;
+  };
+  const mislukt = (ip: string) => {
+    const p = pogingen.get(ip);
+    if (!p || p.tot < Date.now()) pogingen.set(ip, { n: 1, tot: Date.now() + 15 * 60_000 });
+    else p.n += 1;
+  };
+
+  const zekerheidsHeaders = (res: express.Response) =>
+    res.set({
+      "Cache-Control": "no-store",
+      "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'",
+      "X-Content-Type-Options": "nosniff",
+      "Referrer-Policy": "no-referrer",
+    });
+
+  app.get("/oauth/toestemming", async (req, res) => {
+    zekerheidsHeaders(res);
+    const id = typeof req.query.verzoek === "string" ? req.query.verzoek : "";
+    const v = id ? await opslag.verzoekLezen(id) : null;
+    if (!v) {
+      res.status(400).type("html").send(foutPagina("Dit koppelverzoek is onbekend, verlopen of al afgehandeld. Start de koppeling opnieuw vanuit Claude."));
+      return;
+    }
+    res.type("html").send(
+      toestemmingPagina({ verzoek: id, clientNaam: v.clientNaam, redirectHost: new URL(v.redirectUri).host, metWachtwoord: !!AUTH_PASSWORD_HASH }),
+    );
+  });
+
+  app.post("/oauth/toestemming", express.urlencoded({ extended: false, limit: "8kb" }), async (req, res) => {
+    zekerheidsHeaders(res);
+    // Herkomstcontrole in plaats van een CSRF-token: een echte inzending vanaf
+    // deze pagina draagt altijd onze eigen Origin.
+    const origin = req.header("origin");
+    if (!origin || origin !== new URL(PUBLIC_URL).origin) {
+      res.status(403).type("html").send(foutPagina("Verzoek van een onbekende herkomst geweigerd."));
+      return;
+    }
+    const id = String(req.body?.verzoek ?? "");
+    const v = id ? await opslag.verzoekLezen(id) : null;
+    if (!v) {
+      res.status(400).type("html").send(foutPagina("Dit koppelverzoek is onbekend, verlopen of al afgehandeld."));
+      return;
+    }
+    const opnieuw = (melding: string, status: number) =>
+      res.status(status).type("html").send(
+        toestemmingPagina({ verzoek: id, clientNaam: v.clientNaam, redirectHost: new URL(v.redirectUri).host, metWachtwoord: !!AUTH_PASSWORD_HASH, fout: melding }),
+      );
+
+    if (req.body?.besluit === "weigeren") {
+      await opslag.verzoekBesluiten(id, "geweigerd");
+      res.redirect(302, new URL(`/oauth/terug?verzoek=${encodeURIComponent(id)}`, PUBLIC_URL).href);
+      return;
+    }
+    const ip = req.ip ?? "onbekend";
+    if (!magProberen(ip)) return void opnieuw("Te veel mislukte pogingen. Probeer het over een kwartier opnieuw.", 429);
+    const wwOk = !AUTH_PASSWORD_HASH || controleerWachtwoord(String(req.body?.wachtwoord ?? ""), AUTH_PASSWORD_HASH);
+    const codeOk = controleerTotp(TOTP_SECRET, String(req.body?.code ?? ""));
+    if (!wwOk || !codeOk) {
+      mislukt(ip);
+      console.warn(`[oauth] mislukte toestemming vanaf ${ip}`);
+      return void opnieuw("Wachtwoord of code klopt niet.", 401);
+    }
+    if (!(await opslag.verzoekBesluiten(id, "goedgekeurd"))) {
+      res.status(409).type("html").send(foutPagina("Dit verzoek is intussen verlopen of al afgehandeld."));
+      return;
+    }
+    console.log(`[oauth] toegang verleend aan ${v.clientNaam} (${v.clientId})`);
+    res.redirect(302, new URL(`/oauth/terug?verzoek=${encodeURIComponent(id)}`, PUBLIC_URL).href);
+  });
+
+  app.get("/oauth/terug", async (req, res) => {
+    const id = typeof req.query.verzoek === "string" ? req.query.verzoek : "";
+    const doel = id ? await oauth!.afronden(id) : null;
+    if (!doel) {
+      res.status(400).type("html").send(foutPagina("Dit koppelverzoek is verlopen of al gebruikt. Start de koppeling opnieuw vanuit Claude."));
+      return;
+    }
+    res.set("Cache-Control", "no-store").redirect(302, doel);
+  });
+
+  setInterval(() => void opslag.opruimen().catch((e) => console.error("[oauth] opruimen:", e)), 60 * 60_000).unref();
+  console.log(`[oauth] aan — issuer ${PUBLIC_URL}${AUTH_PASSWORD_HASH ? " (wachtwoord + TOTP)" : " (alleen TOTP)"}`);
+} else {
+  console.warn("[oauth] uit: PUBLIC_URL of TOTP_SECRET ontbreekt. claude.ai kan zo niet koppelen; MCP_AUTH_TOKEN werkt wel.");
+}
+
+/* -------------------------------------------------------------------- MCP */
+
+async function mcpToegestaan(req: express.Request): Promise<boolean> {
+  const t = bearer(req);
+  if (!t) return false;
+  if (MCP_AUTH_TOKEN && tokenGelijk(t, MCP_AUTH_TOKEN)) return true;
+  if (!oauth) return false;
+  try {
+    const info = await oauth.verifyAccessToken(t);
+    return info.scopes.includes(SCOPE);
+  } catch {
+    return false;
+  }
+}
+
+app.post("/mcp", express.json({ limit: "1mb" }), async (req, res) => {
+  if (!(await mcpToegestaan(req))) {
+    res.set("WWW-Authenticate", resourceMetadataUrl ? `Bearer resource_metadata="${resourceMetadataUrl}", scope="${SCOPE}"` : "Bearer");
+    res.status(401).json({ jsonrpc: "2.0", error: { code: -32001, message: "Ongeldige of ontbrekende bearer token." }, id: null });
+    return;
+  }
+  const server = new McpServer({ name: "globe-spiegel", version: "1.0.0" });
+  registerTools(server, store.pool);
+  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
+  res.on("close", () => {
+    void transport.close();
+    void server.close();
+  });
+  try {
+    await server.connect(transport);
+    await transport.handleRequest(req, res, req.body);
+  } catch (err) {
+    if (!res.headersSent) {
+      res.status(500).json({ jsonrpc: "2.0", error: { code: -32603, message: err instanceof Error ? err.message : "Interne fout" }, id: null });
+    }
+  }
+});
+
+app.all("/mcp", (_req, res) => {
+  res.set("Allow", "POST").status(405).json({ jsonrpc: "2.0", error: { code: -32000, message: "Alleen POST wordt ondersteund." }, id: null });
+});
+
+app.get("/", (_req, res) => {
+  res.status(404).json({ hint: "Globe-spiegel. MCP op POST /mcp; de agent praat met /agent/*." });
+});
+
+const port = Number(process.env.PORT ?? 3000);
+const host = process.env.HOST ?? "::";
+app.listen(port, host, () => console.log(`[globe-spiegel] luistert op :${port} (${randomUUID().slice(0, 8)})`));
