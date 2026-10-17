@@ -74,6 +74,11 @@ if (process.env.OPSCHONEN_GEBRUIKER) {
   const g = await store.pool.query(`DELETE FROM portaal_gebruiker WHERE email = $1`, [e]);
   console.warn(`[opschonen] gebruiker ${e}: ${g.rowCount} account, ${l.rowCount} logregels verwijderd`);
 }
+//   OPSCHONEN_OAUTH_CLIENT=<client_name>  die OAuth-koppelingen met al hun tokens
+if (process.env.OPSCHONEN_OAUTH_CLIENT) {
+  const c = await store.pool.query(`DELETE FROM oauth_clients WHERE info->>'client_name' = $1`, [process.env.OPSCHONEN_OAUTH_CLIENT]);
+  console.warn(`[opschonen] ${c.rowCount} OAuth-client(s) "${process.env.OPSCHONEN_OAUTH_CLIENT}" met tokens verwijderd`);
+}
 
 // MCP-leestools draaien als vda_lezer; lukt dat niet, dan geen MCP-leestoegang
 // tot de database via een rol met meer rechten.
