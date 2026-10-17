@@ -160,6 +160,14 @@ const STIJL = `${BASIS}
   form.beoordeel input[name=opmerking] { min-width:10rem; flex:1; font-size:.8rem; padding:.25rem .45rem; }
   form.beoordeel select { font-size:.8rem; padding:.25rem .3rem; }
 
+  /* Kop op een smalle telefoon: logo, administratiekeuze, beheer en uitloggen
+     moeten op één regel passen, anders schuift de pagina (en de tabbalk) opzij. */
+  @media (max-width: 520px) {
+    .app-kop .binnen { gap:.5rem; }
+    .merk .wm { display:none !important; }
+    .kop-rechts { gap:.1rem; }
+    .adm-kiezer summary { max-width:11rem; }
+  }
   @media (max-width: 640px) {
     main { padding-top:1rem; }
     h1 { font-size:1.3rem; }

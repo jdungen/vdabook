@@ -103,7 +103,7 @@ export const CONTROLES: Controle[] = [
           FROM per WHERE btw IS NOT NULL AND grondslag IS NOT NULL AND grondslag <> 0 AND abs(btw) > 0.01)
       SELECT dagboek, boekstuk, dagboek || '|' || boekstuk AS sleutel, datum, omschrijving,
              round(grondslag, 2) AS grondslag, round(btw, 2) AS btw,
-             to_char(abs(btw / grondslag) * 100, 'FM990.0') || '%' AS tarief, signaal
+             replace(to_char(abs(btw / grondslag) * 100, 'FM990.0'), '.', ',') || '%' AS tarief, signaal
         FROM sig WHERE signaal IS NOT NULL
        ORDER BY abs(btw) DESC`,
   },
