@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS globe_admin (
   eerst_gezien  timestamptz NOT NULL DEFAULT now(),
   laatst_sync   timestamptz
 );
+ALTER TABLE globe_admin ADD COLUMN IF NOT EXISTS bron text;   -- SQL Server-instance zoals de agent hem zag
 
 -- Eén rij per bronrij, als JSONB. Schema-agnostisch: een Globe-update met extra
 -- kolommen breekt niets.

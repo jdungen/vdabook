@@ -996,7 +996,7 @@ ${beheerNav("/logboek")}
 ${beheerNav("/administraties")}
 ${meldingen(req.query)}
 <div class="kaart schuif"><table class="lijst"><tr><th>Naam</th><th>Database</th><th>Bron</th><th>Laatste sync</th><th>Afgeschermd voor Claude</th></tr>${admins
-          .map((a) => `<tr><td>${esc(adminNaam(a))}</td><td class="mono">${esc(a.database_name)}</td><td class="mono gedempt">${esc(a.admin_key)}</td><td>${tijdstip(a.laatst_sync)}</td><td><form method="post" action="/beheer/administraties" class="knoppen"><input type="hidden" name="admin" value="${esc(a.admin_key)}"><input type="hidden" name="afgeschermd" value="${a.afgeschermd ? "0" : "1"}"><span class="badge ${a.afgeschermd ? "let" : ""}">${a.afgeschermd ? "ja" : "nee"}</span><button class="klein">${a.afgeschermd ? "Opheffen" : "Afschermen"}</button></form></td></tr>`)
+          .map((a) => `<tr><td>${esc(adminNaam(a))}</td><td class="mono">${esc(a.database_name)}</td><td class="mono gedempt">${esc(a.bron ?? a.admin_key)}</td><td>${tijdstip(a.laatst_sync)}</td><td><form method="post" action="/beheer/administraties" class="knoppen"><input type="hidden" name="admin" value="${esc(a.admin_key)}"><input type="hidden" name="afgeschermd" value="${a.afgeschermd ? "0" : "1"}"><span class="badge ${a.afgeschermd ? "let" : ""}">${a.afgeschermd ? "ja" : "nee"}</span><button class="klein">${a.afgeschermd ? "Opheffen" : "Afschermen"}</button></form></td></tr>`)
           .join("")}</table></div>
 <p class="uitleg">Afschermen geldt alleen voor de leestools in Claude: Claude vraagt dan eerst om uitdrukkelijke bevestiging. In het portaal regel je zichtbaarheid per account bij Gebruikers.</p>`,
       ),

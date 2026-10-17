@@ -32,7 +32,7 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
 
-$AgentVersie = '1.0.0'
+$AgentVersie = '1.1.0'
 $Map = Split-Path -Parent $ConfigPad
 $LogMap = Join-Path $Map 'logs'
 if (-not (Test-Path $LogMap)) { New-Item -ItemType Directory -Path $LogMap -Force | Out-Null }
@@ -369,7 +369,7 @@ foreach ($inst in (Vind-Instances)) {
   try {
     $m = Open-Sql $inst
     $instNaam = [string](Sql-Waarde $m 'SELECT @@SERVERNAME')
-    $dbs = Sql-Tabel $m "SELECT name FROM sys.databases WHERE database_id > 4 AND state = 0 AND HAS_DBACCESS(name) = 1 ORDER BY name"
+    $dbs = Sql-Tabel $m "SELECT name, CONVERT(varchar(36), service_broker_guid) AS guid FROM sys.databases WHERE database_id > 4 AND state = 0 AND HAS_DBACCESS(name) = 1 ORDER BY name"
     $m.Close()
     foreach ($d in $dbs.Rows) {
       $db = [string]$d.name
@@ -381,15 +381,17 @@ foreach ($inst in (Vind-Instances)) {
         try { $naam = [string](Sql-Waarde $c "SELECT TOP 1 LTRIM(RTRIM(bedrnm)) FROM dbo.bedryf") } catch { }
         $tabellen = Lees-Tabellen $c
         $c.Close()
-        $key = "$instNaam/$db"
+        # Identiteit = database-GUID: blijft gelijk als de pc of instance een andere naam krijgt.
+        $key = "$db@" + ([string]$d.guid).ToLower()
         $admins += @{
           admin_key    = $key
+          bron         = "$instNaam"
           database     = $db
           bedrijfsnaam = $naam
           tabellen     = @($tabellen | ForEach-Object { @{ tbl = $_.tbl; strategie = $_.strategie; sleutel = $_.sleutel; kolommen = $_.kolommen; bron_aantal = $_.rijen } })
         }
         $plan[$key] = @{ instance = $inst; database = $db; tabellen = $tabellen }
-        Log "Gevonden: $key ($naam), $($tabellen.Count) tabellen"
+        Log "Gevonden: $instNaam/$db ($naam), $($tabellen.Count) tabellen"
       } catch {
         Log "Database $db op $inst overgeslagen: $($_.Exception.Message)" 'WARN'
         [void]$fouten.Add("$inst/$db`: $($_.Exception.Message)")

@@ -16,6 +16,7 @@ export interface TabelMelding {
 export interface AdminMelding {
   admin_key: string;
   database: string;
+  bron?: string | null;
   bedrijfsnaam?: string | null;
   tabellen: TabelMelding[];
 }
@@ -80,13 +81,14 @@ export class Store {
         // afgeschermd wordt alleen áángezet door de automaat; uitzetten is een
         // bewuste handeling in de database, niet iets wat een naamswijziging doet.
         await client.query(
-          `INSERT INTO globe_admin (admin_key, database_name, bedrijfsnaam, afgeschermd)
-           VALUES ($1, $2, $3, $4)
+          `INSERT INTO globe_admin (admin_key, database_name, bedrijfsnaam, afgeschermd, bron)
+           VALUES ($1, $2, $3, $4, $5)
            ON CONFLICT (admin_key) DO UPDATE
               SET database_name = EXCLUDED.database_name,
+                  bron          = COALESCE(EXCLUDED.bron, globe_admin.bron),
                   bedrijfsnaam  = COALESCE(EXCLUDED.bedrijfsnaam, globe_admin.bedrijfsnaam),
                   afgeschermd   = globe_admin.afgeschermd OR EXCLUDED.afgeschermd`,
-          [a.admin_key, a.database, a.bedrijfsnaam ?? null, afgeschermd],
+          [a.admin_key, a.database, a.bedrijfsnaam ?? null, afgeschermd, a.bron ?? null],
         );
 
         toestand[a.admin_key] = {};

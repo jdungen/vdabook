@@ -63,7 +63,7 @@ await store.migrate();
 //   OPSCHONEN_GEBRUIKER=<e-mail>   dat account en zijn logregels
 if (process.env.OPSCHONEN_PC) {
   const pc = process.env.OPSCHONEN_PC;
-  const a = await store.pool.query(`DELETE FROM globe_admin WHERE starts_with(admin_key, $1 || '\\') RETURNING admin_key`, [pc]);
+  const a = await store.pool.query(`DELETE FROM globe_admin WHERE starts_with(admin_key, $1 || '\\') OR starts_with(COALESCE(bron, ''), $1 || '\\') RETURNING admin_key`, [pc]);
   const r = await store.pool.query(`DELETE FROM globe_run WHERE host = $1`, [pc]);
   await store.pool.query(`DELETE FROM gb_mutatie m WHERE NOT EXISTS (SELECT 1 FROM globe_admin a WHERE a.admin_key = m.admin_key)`);
   console.warn(`[opschonen] pc ${pc}: ${a.rowCount} administratie(s) en ${r.rowCount} run(s) verwijderd`);

@@ -27,6 +27,7 @@ export interface Admin {
   bedrijfsnaam: string | null;
   afgeschermd: boolean;
   laatst_sync: Date | null;
+  bron: string | null;
 }
 
 const sha = (s: string) => createHash("sha256").update(s, "utf8").digest("hex");
@@ -196,14 +197,14 @@ export class Gebruikers {
     const r =
       g.rol === "beheerder"
         ? await this.pool.query<Admin>(
-            `SELECT a.admin_key, a.database_name, a.bedrijfsnaam, a.afgeschermd, a.laatst_sync,
+            `SELECT a.admin_key, a.database_name, a.bedrijfsnaam, a.afgeschermd, a.laatst_sync, a.bron,
                     CASE WHEN count(*) OVER (PARTITION BY a.database_name) > 1
                          THEN a.database_name || '-' || substr(md5(a.admin_key), 1, 4) ELSE a.database_name END AS slug
                FROM globe_admin a ORDER BY a.database_name, a.admin_key`,
           )
         : await this.pool.query<Admin>(
             `SELECT * FROM (
-               SELECT a.admin_key, a.database_name, a.bedrijfsnaam, a.afgeschermd, a.laatst_sync,
+               SELECT a.admin_key, a.database_name, a.bedrijfsnaam, a.afgeschermd, a.laatst_sync, a.bron,
                       CASE WHEN count(*) OVER (PARTITION BY a.database_name) > 1
                          THEN a.database_name || '-' || substr(md5(a.admin_key), 1, 4) ELSE a.database_name END AS slug
                  FROM globe_admin a) a
