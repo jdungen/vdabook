@@ -58,6 +58,23 @@ const OVERSLAAN = process.env.OVERSLAAN_TABELLEN ? new RegExp(process.env.OVERSL
 const store = new Store(DATABASE_URL, AFSCHERM, OVERSLAAN);
 await store.migrate();
 
+// Eenmalig opschonen na een test, aangestuurd via variabelen (daarna weghalen):
+//   OPSCHONEN_PC=<hostnaam>        administraties en runs van die pc
+//   OPSCHONEN_GEBRUIKER=<e-mail>   dat account en zijn logregels
+if (process.env.OPSCHONEN_PC) {
+  const pc = process.env.OPSCHONEN_PC;
+  const a = await store.pool.query(`DELETE FROM globe_admin WHERE starts_with(admin_key, $1 || '\\') RETURNING admin_key`, [pc]);
+  const r = await store.pool.query(`DELETE FROM globe_run WHERE host = $1`, [pc]);
+  await store.pool.query(`DELETE FROM gb_mutatie m WHERE NOT EXISTS (SELECT 1 FROM globe_admin a WHERE a.admin_key = m.admin_key)`);
+  console.warn(`[opschonen] pc ${pc}: ${a.rowCount} administratie(s) en ${r.rowCount} run(s) verwijderd`);
+}
+if (process.env.OPSCHONEN_GEBRUIKER) {
+  const e = process.env.OPSCHONEN_GEBRUIKER.toLowerCase();
+  const l = await store.pool.query(`DELETE FROM portaal_log WHERE lower(email) = $1`, [e]);
+  const g = await store.pool.query(`DELETE FROM portaal_gebruiker WHERE email = $1`, [e]);
+  console.warn(`[opschonen] gebruiker ${e}: ${g.rowCount} account, ${l.rowCount} logregels verwijderd`);
+}
+
 const app = express();
 app.set("trust proxy", 1);
 app.disable("x-powered-by");
