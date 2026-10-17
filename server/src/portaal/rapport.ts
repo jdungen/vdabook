@@ -383,3 +383,157 @@ export class Rapport {
     return { runs: runs.rows, tabellen: tabellen.rows };
   }
 }
+
+/* ───────────────────────────── aansluiting en onderlinge verhoudingen ── */
+
+/**
+ * Trefwoord waarmee een administratie in de rekeningnamen van een andere
+ * administratie herkend wordt: de bedrijfsnaam zonder rechtsvorm en
+ * familienaam. "Van Dungen Automaten B.V." → "automaten", "De Drie D Holding
+ * B.V." → "drie d", "Stichting Administratiekantoor Familiefonds Van den
+ * Dungen" → "familiefonds".
+ */
+export function trefwoord(bedrijfsnaam: string | null): string | null {
+  if (!bedrijfsnaam) return null;
+  const rest = bedrijfsnaam
+    .toLowerCase()
+    .replace(/[.,]/g, " ")
+    .split(/\s+/)
+    .filter((w) => w && !["b", "v", "bv", "nv", "n", "van", "den", "der", "dungen", "de", "stichting", "administratiekantoor", "holding", "beheer"].includes(w));
+  return rest.length ? rest.join(" ") : null;
+}
+
+const RC = "(r/?c|rek(ening)?[ .-]*cour|groep|deelnem|lening|vordering|schuld)";
+
+export interface AansluitRegel {
+  post: string;
+  label: string;
+  spiegel: number | null;
+  jaarrekening: number;
+  verschil: number | null;
+  noot: string;
+}
+
+export interface OnderlingPaar {
+  a: { admin_key: string; naam: string; rekening: string; omschrijving: string; saldo: number }[];
+  b: { admin_key: string; naam: string; rekening: string; omschrijving: string; saldo: number }[];
+  naamA: string;
+  naamB: string;
+  somA: number;
+  somB: number;
+  verschil: number;
+  refA: number | null;
+  refB: number | null;
+}
+
+export class Aansluiting {
+  constructor(private readonly pool: pg.Pool) {}
+
+  /** Saldo per balansrekening eind boekjaar, met dezelfde beginbalansmethode als het balansscherm. */
+  private async balansSaldi(admin: string, jaar: number) {
+    const r = await this.pool.query<{ grootboek: string; oms: string | null; bal_vw: string | null; saldo: string }>(
+      `WITH rek AS (SELECT trim(data->>'reknr') AS grootboek, data->>'oms25_0' AS oms, upper(trim(data->>'bal_vw')) AS bal_vw
+                      FROM globe_row WHERE admin_key = $1 AND tbl = 'grtbk'),
+            begin AS (SELECT EXISTS (SELECT 1 FROM gb_mutatie WHERE admin_key = $1 AND boekjaar = $2 AND periode = 0) AS ja)
+       SELECT m.grootboek, max(rek.oms) AS oms, max(rek.bal_vw) AS bal_vw, sum(m.bedrag) AS saldo
+         FROM gb_mutatie m LEFT JOIN rek ON rek.grootboek = m.grootboek
+        WHERE m.admin_key = $1
+          AND CASE WHEN (SELECT ja FROM begin) THEN m.boekjaar = $2 ELSE m.boekjaar <= $2 END
+        GROUP BY m.grootboek`,
+      [admin, jaar],
+    );
+    return r.rows.map((x) => ({ ...x, saldo: Number(x.saldo) }));
+  }
+
+  async regels(admin: string, bedrijfsnaam: string | null, jaar: number): Promise<{ regels: AansluitRegel[]; bron: string | null }> {
+    const ref = await this.pool.query<{ post: string; bedrag: string; bron: string | null }>(
+      `SELECT post, bedrag, bron FROM jaarrekening_ref WHERE jaar = $2 AND $1 ILIKE '%' || bedrijf || '%' AND post NOT LIKE 'rc:%'`,
+      [bedrijfsnaam ?? "", jaar],
+    );
+    if (ref.rowCount === 0) return { regels: [], bron: null };
+    const s = await this.balansSaldi(admin, jaar);
+    const balans = s.filter((x) => (x.bal_vw ?? "B") === "B");
+    const wv = s.filter((x) => x.bal_vw === "W");
+    // Resultaat van dit boekjaar alleen (W-rekeningen van $2).
+    const res = await this.pool.query<{ r: string | null }>(
+      `WITH rek AS (SELECT trim(data->>'reknr') AS grootboek, upper(trim(data->>'bal_vw')) AS bal_vw FROM globe_row WHERE admin_key = $1 AND tbl = 'grtbk')
+       SELECT -sum(m.bedrag) AS r FROM gb_mutatie m JOIN rek ON rek.grootboek = m.grootboek AND rek.bal_vw = 'W'
+        WHERE m.admin_key = $1 AND m.boekjaar = $2`,
+      [admin, jaar],
+    );
+    const heeftData = s.length > 0;
+    const resultaat = heeftData ? Number(res.rows[0]?.r ?? 0) : null;
+    const activa = heeftData ? balans.filter((x) => x.saldo > 0).reduce((t, x) => t + x.saldo, 0) : null;
+    const liquide = heeftData
+      ? balans.filter((x) => /(bank|\bkas\b|kasgeld|rabo|\bing\b|abn|knab|triodos|spaar|deposito|giro|kruispost|van lanschot)/i.test(x.oms ?? "")).reduce((t, x) => t + x.saldo, 0)
+      : null;
+    // Eigen vermogen na resultaatbestemming: kapitaal en reserves plus het (nog niet verdeelde) resultaat.
+    const ev = heeftData
+      ? -balans.filter((x) => /(kapitaal|reserve|eigen vermogen|agio|winst ?saldo|onverdeeld)/i.test(x.oms ?? "")).reduce((t, x) => t + x.saldo, 0) -
+        wv.reduce((t, x) => t + x.saldo, 0)
+      : null;
+    const spiegel: Record<string, number | null> = { resultaat, activa, liquide, eigen_vermogen: ev };
+    const LABEL: Record<string, [string, string]> = {
+      resultaat: ["Resultaat na belastingen", "Verschil kan komen van boekingen die de accountant buiten Globe maakt (vennootschapsbelasting, resultaat deelnemingen, afschrijvingen)."],
+      activa: ["Totaal activa", "Spiegel: som van de balansrekeningen met een debetsaldo. Verrekening van rekeningen met een creditsaldo in de jaarrekening geeft verschil."],
+      liquide: ["Liquide middelen", "Spiegel: rekeningen met bank, kas, spaar, kruisposten en dergelijke in de naam."],
+      eigen_vermogen: ["Eigen vermogen", "Spiegel: kapitaal en reserves plus het nog niet verdeelde resultaat."],
+      omzet: ["Netto-omzet", "Niet automatisch te bepalen zonder rubricering; alleen ter referentie."],
+    };
+    const regels = ref.rows.map((x) => {
+      const j = Number(x.bedrag);
+      const sp = x.post in spiegel ? spiegel[x.post]! : null;
+      return {
+        post: x.post,
+        label: LABEL[x.post]?.[0] ?? x.post,
+        spiegel: sp,
+        jaarrekening: j,
+        verschil: sp === null ? null : Math.round((sp - j) * 100) / 100,
+        noot: LABEL[x.post]?.[1] ?? "",
+      };
+    });
+    const volgorde = ["resultaat", "eigen_vermogen", "activa", "liquide", "omzet"];
+    regels.sort((a, b) => volgorde.indexOf(a.post) - volgorde.indexOf(b.post));
+    return { regels, bron: ref.rows[0]?.bron ?? null };
+  }
+
+  /**
+   * Rekening-courantposities tussen administraties. In administratie A zoeken
+   * we rekeningen waarvan de naam het trefwoord van B bevat en die op een
+   * vordering of schuld lijken, en omgekeerd. Samen horen ze nul te zijn.
+   */
+  async onderling(admins: Array<{ admin_key: string; bedrijfsnaam: string | null; database_name: string }>, jaar: number): Promise<OnderlingPaar[]> {
+    const saldi = new Map<string, Awaited<ReturnType<Aansluiting["balansSaldi"]>>>();
+    for (const a of admins) saldi.set(a.admin_key, await this.balansSaldi(a.admin_key, jaar));
+    const naam = (a: (typeof admins)[number]) => a.bedrijfsnaam ?? `Administratie ${a.database_name}`;
+    const refs = (await this.pool.query<{ bedrijf: string; post: string; bedrag: string }>(`SELECT bedrijf, post, bedrag FROM jaarrekening_ref WHERE jaar = $1 AND post LIKE 'rc:%'`, [jaar])).rows;
+    const ref = (a: (typeof admins)[number], b: (typeof admins)[number]) => {
+      const tb = trefwoord(b.bedrijfsnaam);
+      const r = refs.find((x) => (a.bedrijfsnaam ?? "").toLowerCase().includes(x.bedrijf.toLowerCase()) && tb && x.post === `rc:${tb}`);
+      return r ? Number(r.bedrag) : null;
+    };
+    const uit: OnderlingPaar[] = [];
+    for (let i = 0; i < admins.length; i++) {
+      for (let j = i + 1; j < admins.length; j++) {
+        const A = admins[i]!;
+        const B = admins[j]!;
+        const ta = trefwoord(A.bedrijfsnaam);
+        const tb = trefwoord(B.bedrijfsnaam);
+        if (!ta || !tb) continue;
+        const zoek = (in_: (typeof admins)[number], woord: string) =>
+          (saldi.get(in_.admin_key) ?? [])
+            .filter((x) => (x.bal_vw ?? "B") === "B" && (x.oms ?? "").toLowerCase().includes(woord) && new RegExp(RC, "i").test(x.oms ?? ""))
+            .map((x) => ({ admin_key: in_.admin_key, naam: naam(in_), rekening: x.grootboek, omschrijving: x.oms ?? "", saldo: Math.round(x.saldo * 100) / 100 }));
+        const a = zoek(A, tb);
+        const b = zoek(B, ta);
+        const refA = ref(A, B);
+        const refB = ref(B, A);
+        if (a.length === 0 && b.length === 0 && refA === null && refB === null) continue;
+        const somA = a.reduce((t, x) => t + x.saldo, 0);
+        const somB = b.reduce((t, x) => t + x.saldo, 0);
+        uit.push({ a, b, naamA: naam(A), naamB: naam(B), somA, somB, verschil: Math.round((somA + somB) * 100) / 100, refA, refB });
+      }
+    }
+    return uit;
+  }
+}

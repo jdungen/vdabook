@@ -9,7 +9,8 @@ import type { OAuthOpslag } from "../oauth-opslag.js";
 import { cookieRegel, leesCookies, leesSessie, maakSessie, nieuwTotpSecret, otpauthUri, controleerTotp, Pogingen } from "../auth.js";
 import { BEELDMERK_PNG, ICOON_PNG, WOORDMERK_PNG } from "../logo.js";
 import { Gebruikers, MIN_WACHTWOORD, type Admin, type Gebruiker, type Rol } from "./gebruikers.js";
-import { Rapport, LOON_TABEL } from "./rapport.js";
+import { Rapport, LOON_TABEL, Aansluiting, type OnderlingPaar } from "./rapport.js";
+type OnderlingRegel = OnderlingPaar["a"][number];
 import { Audit, type Kolom } from "./audit.js";
 import { adminNaam, bedragCel, datum, esc, euro, geleden, getal, kader, losKader, meldingen, qs, tijdstip } from "./ui.js";
 
@@ -66,6 +67,7 @@ export function portaal(o: PortaalOpties): express.Router {
   const g = o.gebruikers;
   const rapport = new Rapport(o.pool);
   const audit = new Audit(o.pool);
+  const aansluiting = new Aansluiting(o.pool);
   const pogingen = new Pogingen();
   setInterval(() => pogingen.opruimen(), 30 * 60_000).unref();
 
@@ -376,7 +378,42 @@ ${melding ? `<div class="bericht mis">${esc(melding)}</div>` : ""}
       kader(
         { titel: "Overzicht", g: req.g!, admins },
         `<header class="top"><div><h1>Administraties</h1><p class="sub">Exact Globe+ · alleen lezen · ingelogd als ${esc(req.g!.naam)} (${esc(req.g!.rol)})</p></div></header>
+${admins.length > 1 ? `<p><a class="knop" href="/onderling">Onderlinge verhoudingen tussen de administraties</a></p>` : ""}
 ${admins.length === 0 ? `<div class="leeg">${req.g!.rol === "beheerder" ? "Nog geen administraties. Zodra de agent op de Globe-pc zijn eerste run heeft gedaan, staan ze hier. Zie <a href=\"/beheer/sync\">Beheer › Synchronisatie</a>." : "Je hebt nog geen toegang tot een administratie. Vraag de beheerder."}</div>` : `<div class="tegels">${tegels.join("")}</div>`}`,
+      ),
+    );
+  });
+
+  /* ------------------------------------------------ onderlinge verhoudingen */
+
+  r.get("/onderling", async (req, res) => {
+    const admins = await g.admins(req.g!);
+    const jaren = Array.from(new Set((await Promise.all(admins.map((a) => rapport.boekjaren(a.admin_key)))).flat())).sort((x, y) => y - x);
+    const jaar = int(req.query.jaar) && jaren.includes(int(req.query.jaar)!) ? int(req.query.jaar)! : (jaren[0] ?? new Date().getFullYear());
+    const paren = await aansluiting.onderling(admins, jaar);
+    await log(req, "bekijk_onderling", null, { jaar });
+    const kant = (rijen: OnderlingRegel[], som: number, ref: number | null, naam: string) =>
+      `<div class="kaart schuif"><table class="lijst"><tr class="kop"><td colspan="3">${esc(naam)}</td></tr>${
+        rijen.length
+          ? rijen.map((x) => `<tr><td class="mono">${esc(x.rekening)}</td><td>${esc(x.omschrijving)}</td>${bedragCel(x.saldo)}</tr>`).join("")
+          : `<tr><td colspan="3" class="gedempt">Geen rekening gevonden met de naam van de andere partij.</td></tr>`
+      }<tr class="totaal"><td colspan="2">Saldo in Globe (+ vordering, − schuld)</td>${bedragCel(som)}</tr>${
+        ref !== null ? `<tr><td colspan="2" class="gedempt">Volgens de jaarrekening</td>${bedragCel(ref)}</tr>` : ""
+      }</table></div>`;
+    res.type("html").send(
+      kader(
+        { titel: "Onderlinge verhoudingen", g: req.g!, admins },
+        `<header class="top"><div><h1>Onderlinge verhoudingen</h1><p class="sub">Rekening-courant en andere posities tussen de administraties, eind ${jaar}</p></div>
+<form class="filter" method="get"><label>Boekjaar<select name="jaar">${jaren.map((j) => `<option${j === jaar ? " selected" : ""}>${j}</option>`).join("")}</select></label><button>Toon</button></form></header>
+<p class="uitleg">Wat de ene administratie van de andere te vorderen heeft, hoort de andere precies als schuld te tonen. Samen moeten ze op nul uitkomen. Rekeningen worden herkend aan de naam van de andere partij (bijv. "R/C Drie D Holding"). Vergelijking met de jaarrekening waar die is ingelezen.</p>
+${paren.length === 0 ? `<div class="leeg">Nog geen onderlinge posities gevonden${admins.length < 2 ? " — je hebt toegang tot maar één administratie" : ""}.</div>` : paren
+          .map((p) => {
+            const refVerschil = p.refA !== null && p.refB !== null ? Math.round((p.refA + p.refB) * 100) / 100 : null;
+            return `<h2>${esc(p.naamA)} ↔ ${esc(p.naamB)}</h2>
+<div class="tegels" style="grid-template-columns:repeat(auto-fit,minmax(22rem,1fr))">${kant(p.a, p.somA, p.refA, p.naamA)}${kant(p.b, p.somB, p.refB, p.naamB)}</div>
+<p>${p.a.length || p.b.length ? (Math.abs(p.verschil) < 1 ? `<span class="badge ok">Globe sluit</span>` : `<span class="badge let">Globe sluit niet: ${euro(p.verschil)}</span>`) : ""} ${refVerschil === null ? "" : Math.abs(refVerschil) < 1 ? `<span class="badge ok">jaarrekeningen sluiten</span>` : `<span class="badge mis">jaarrekeningen sluiten niet: ${euro(refVerschil)}</span>`}</p>`;
+          })
+          .join("")}`,
       ),
     );
   });
@@ -392,6 +429,7 @@ ${admins.length === 0 ? `<div class="leeg">${req.g!.rol === "beheerder" ? "Nog g
     const vorig = jaren.includes(jaar - 1) ? await rapport.kerncijfers(a.admin_key, jaar - 1) : null;
     const recent = await rapport.recent(a.admin_key, 30, req.g!.lonen);
     const wie = await rapport.gebruikers(a.admin_key, jaar);
+    const ans = await aansluiting.regels(a.admin_key, a.bedrijfsnaam, jaar);
     const db = a.slug;
     const liq = (k.liquide as Array<{ grootboek: string; oms: string; saldo: string }>).reduce((t, x) => t + Number(x.saldo), 0);
 
@@ -424,6 +462,11 @@ ${a.laatst_sync && Date.now() - new Date(a.laatst_sync).getTime() > 3 * 86400_00
   ${tegel("Liquide middelen eind " + jaar, euro(liq), (k.liquide as any[]).map((x) => `${esc(x.oms)}: ${euro(x.saldo)}`).join("<br>") || "geen bank- of kasrekening herkend")}
   ${tegel("Boekstukken", getal(k.boekstukken), `${getal(k.regels)} regels · laatste boekdatum ${datum(k.laatste_datum)}`)}
 </div>
+${ans.regels.length ? `<h2>Aansluiting met de jaarrekening ${jaar}</h2>
+<p class="uitleg">Cijfers uit de spiegel naast die uit ${esc(ans.bron ?? "de jaarrekening")}. Een verschil is geen fout op zich: de accountant boekt vaak correcties buiten Globe. Het laat zien wat er tussen de boekhouding en de jaarrekening gebeurt.</p>
+<div class="kaart schuif"><table class="lijst"><tr><th>Post</th><th class="r">Spiegel (Globe)</th><th class="r">Jaarrekening</th><th class="r">Verschil</th><th>Toelichting</th></tr>${ans.regels
+          .map((x) => `<tr><td>${esc(x.label)}</td>${bedragCel(x.spiegel)}${bedragCel(x.jaarrekening)}<td class="r num">${x.verschil === null ? "" : Math.abs(x.verschil) < 1 ? `<span class="badge ok">sluit</span>` : `<span class="badge let">${euro(x.verschil)}</span>`}</td><td class="gedempt" style="font-size:.8rem;max-width:28rem">${esc(x.noot)}</td></tr>`)
+          .join("")}</table></div>` : ""}
 <h2>Wat er de afgelopen 30 dagen is geboekt</h2>
 <p class="uitleg">Nieuw in de spiegel sinds de eerste volledige sync, per dag en dagboek.</p>
 ${nieuwRijen ? `<div class="kaart schuif"><table class="lijst"><tr><th>Gezien</th><th>Dagboek</th><th class="r">Boekstukken</th><th class="r">Regels</th><th class="r">Omvang</th><th></th></tr>${nieuwRijen}</table></div>` : `<div class="leeg">Geen nieuwe boekingen gezien in de afgelopen 30 dagen.</div>`}

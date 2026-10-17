@@ -80,6 +80,30 @@ if (process.env.OPSCHONEN_OAUTH_CLIENT) {
   console.warn(`[opschonen] ${c.rowCount} OAuth-client(s) "${process.env.OPSCHONEN_OAUTH_CLIENT}" met tokens verwijderd`);
 }
 
+// Referentiecijfers uit de jaarrekeningen (JSON in de omgeving, niet in git):
+// { "<stuk bedrijfsnaam>": { "<jaar>": { "<post>": bedrag, ... }, "_bron": "..." } }
+if (process.env.JAARREKENING_REF) {
+  try {
+    const ref = JSON.parse(process.env.JAARREKENING_REF) as Record<string, Record<string, unknown>>;
+    let n = 0;
+    await store.pool.query("DELETE FROM jaarrekening_ref");
+    for (const [bedrijf, jaren] of Object.entries(ref)) {
+      const bron = typeof jaren._bron === "string" ? jaren._bron : null;
+      for (const [jaar, posten] of Object.entries(jaren)) {
+        if (!/^\d{4}$/.test(jaar) || typeof posten !== "object" || !posten) continue;
+        for (const [post, bedrag] of Object.entries(posten as Record<string, unknown>)) {
+          if (typeof bedrag !== "number") continue;
+          await store.pool.query(`INSERT INTO jaarrekening_ref (bedrijf, jaar, post, bedrag, bron) VALUES ($1, $2, $3, $4, $5)`, [bedrijf, Number(jaar), post, bedrag, bron]);
+          n++;
+        }
+      }
+    }
+    console.log(`[jaarrekening] ${n} referentiecijfers geladen`);
+  } catch (e) {
+    console.error("[jaarrekening] JAARREKENING_REF onleesbaar:", e instanceof Error ? e.message : e);
+  }
+}
+
 // MCP-leestools draaien als vda_lezer; lukt dat niet, dan geen MCP-leestoegang
 // tot de database via een rol met meer rechten.
 const lezer = await store.lezerPool(DATABASE_URL, process.env.SESSION_SECRET ?? AGENT_TOKEN);

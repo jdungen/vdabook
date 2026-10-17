@@ -303,3 +303,16 @@ CREATE TABLE IF NOT EXISTS audit_beoordeling (
   tijd         timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS audit_beoordeling_sleutel ON audit_beoordeling (admin_key, controle, sleutel, tijd DESC);
+
+-- Referentiecijfers uit de (concept)jaarrekening, om de spiegel op aan te
+-- sluiten. Gevuld vanuit de omgeving (JAARREKENING_REF), niet uit de repo.
+-- bedrijf = stuk van de bedrijfsnaam; post = resultaat | activa | liquide |
+-- eigen_vermogen | rc:<trefwoord andere administratie> (positief = vordering).
+CREATE TABLE IF NOT EXISTS jaarrekening_ref (
+  bedrijf  text NOT NULL,
+  jaar     int  NOT NULL,
+  post     text NOT NULL,
+  bedrag   numeric NOT NULL,
+  bron     text,
+  PRIMARY KEY (bedrijf, jaar, post)
+);
