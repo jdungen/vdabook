@@ -29,7 +29,11 @@ param(
 $ErrorActionPreference = 'Stop'
 $Doel = Join-Path $env:ProgramData 'VDA-GlobeSync'
 $TaakNaam = 'VDA Book - Globe sync'
-$Login = 'NT AUTHORITY\SYSTEM'
+# Accountnamen verschillen per taal van Windows (Nederlands, Duits, ...). Daarom
+# altijd via de vaste SID's werken en de lokale naam pas hier opvragen.
+$SidSystem = New-Object Security.Principal.SecurityIdentifier('S-1-5-18')
+$SidAdmins = New-Object Security.Principal.SecurityIdentifier('S-1-5-32-544')
+$Login = $SidSystem.Translate([Security.Principal.NTAccount]).Value
 
 function Stap([string]$t) { Write-Host "`n== $t" -ForegroundColor Cyan }
 function Ok([string]$t) { Write-Host "   $t" -ForegroundColor Green }
@@ -86,7 +90,7 @@ New-Item -ItemType Directory -Path (Join-Path $Doel 'logs') -Force | Out-Null
 # aanpassen (het draait als SYSTEM) en de config niet lezen.
 $acl = New-Object Security.AccessControl.DirectorySecurity
 $acl.SetAccessRuleProtection($true, $false)
-foreach ($wie in @('NT AUTHORITY\SYSTEM', 'BUILTIN\Administrators')) {
+foreach ($wie in @($SidSystem, $SidAdmins)) {
   $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($wie, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
 }
 Set-Acl -Path $Doel -AclObject $acl
@@ -131,13 +135,17 @@ function Uitvoeren($c, [string]$sql) {
 }
 
 $grant = @"
-IF SUSER_ID(N'$Login') IS NULL CREATE LOGIN [$Login] FROM WINDOWS;
+IF SUSER_SID(N'$Login') IS NULL AND NOT EXISTS (SELECT 1 FROM sys.server_principals WHERE sid = 0x010100000000000512000000)
+  CREATE LOGIN [$Login] FROM WINDOWS;
 "@
-$perDb = @"
+# Gebruik in de databases de naam waaronder SQL Server het systeemaccount al kent.
+$LoginSql = $null
+$perDbSjabloon = @"
 IF OBJECT_ID('dbo.gbkmut') IS NOT NULL AND OBJECT_ID('dbo.grtbk') IS NOT NULL
 BEGIN
-  IF DATABASE_PRINCIPAL_ID(N'$Login') IS NULL CREATE USER [$Login] FOR LOGIN [$Login];
-  EXEC sp_addrolemember N'db_datareader', N'$Login';
+  DECLARE @u sysname = (SELECT name FROM sys.database_principals WHERE sid = 0x010100000000000512000000);
+  IF @u IS NULL BEGIN CREATE USER [{LOGIN}] FOR LOGIN [{LOGIN}]; SET @u = N'{LOGINSTR}'; END
+  EXEC sp_addrolemember N'db_datareader', @u;
   SELECT 1;
 END
 ELSE SELECT 0;
@@ -155,12 +163,15 @@ foreach ($inst in $instances) {
   }
   try {
     [void](Uitvoeren $c $grant)
+    $LoginSql = [string](Uitvoeren $c "SELECT name FROM sys.server_principals WHERE sid = 0x010100000000000512000000")
+    if (-not $LoginSql) { $LoginSql = $Login }
+    $perDb = $perDbSjabloon.Replace('{LOGIN}', $LoginSql.Replace(']', ']]')).Replace('{LOGINSTR}', $LoginSql.Replace("'", "''"))
     $cmd = $c.CreateCommand(); $cmd.CommandText = 'SELECT name FROM sys.databases WHERE database_id > 4 AND state = 0 ORDER BY name'
     $rd = $cmd.ExecuteReader(); $dbs = @(); while ($rd.Read()) { $dbs += $rd.GetString(0) }; $rd.Close()
     foreach ($db in $dbs) {
       try {
         $c.ChangeDatabase($db)
-        if ([int](Uitvoeren $c $perDb) -eq 1) { Ok "$inst / $db : db_datareader voor $Login"; $gevonden++ }
+        if ([int](Uitvoeren $c $perDb) -eq 1) { Ok "$inst / $db : db_datareader voor $LoginSql"; $gevonden++ }
       } catch { Let "$inst / $db overgeslagen: $($_.Exception.Message)" }
     }
   } catch {
@@ -179,12 +190,12 @@ $actie = New-ScheduledTaskAction -Execute 'powershell.exe' `
 $bijStart = New-ScheduledTaskTrigger -AtStartup
 $bijStart.Delay = 'PT2M'
 $elkHalfUur = New-ScheduledTaskTrigger -Once -At (Get-Date).Date -RepetitionInterval (New-TimeSpan -Minutes 30)
-$wie = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+$wie = New-ScheduledTaskPrincipal -UserId $Login -LogonType ServiceAccount -RunLevel Highest
 $instellingen = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
   -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 4) -RestartCount 2 -RestartInterval (New-TimeSpan -Minutes 5)
 Register-ScheduledTask -TaskName $TaakNaam -Action $actie -Trigger @($bijStart, $elkHalfUur) -Principal $wie -Settings $instellingen `
   -Description 'VDA Book: spiegelt de Exact Globe+-administraties read-only naar de spiegel op Railway. Bij opstarten en elk half uur.' -Force | Out-Null
-Ok "'$TaakNaam': bij opstarten (+2 min) en elk half uur, als SYSTEM"
+Ok "'$TaakNaam': bij opstarten (+2 min) en elk half uur, als $Login"
 
 if (-not $GeenEersteRun) {
   Stap 'Eerste sync starten'
