@@ -310,6 +310,22 @@ export const CONTROLES: Controle[] = [
        GROUP BY dagboek, boekstuk ORDER BY min(datum)`,
   },
   {
+    id: "datum_toekomst",
+    titel: "Boekdatum in de toekomst",
+    uitleg: "Boekstukken met een boekdatum na vandaag. Bijna altijd een tikfout in het jaartal (2026 in plaats van 2025); vooruitgeboekte memoriaalposten kunnen terecht zijn.",
+    kolommen: [
+      { k: "boekstuk", label: "Boekstuk", soort: "boekstuk" },
+      { k: "datum", label: "Boekdatum", soort: "datum" },
+      { k: "periode", label: "Periode", soort: "getal" },
+      { k: "omvang", label: "Omvang", soort: "bedrag" },
+      { k: "omschrijving", label: "Omschrijving" },
+    ],
+    sql: (lonen) => `SELECT dagboek, boekstuk, dagboek || '|' || boekstuk AS sleutel, min(datum) AS datum, min(periode) AS periode,
+             round(sum(abs(bedrag)) / 2, 2) AS omvang, min(omschrijving) AS omschrijving
+        FROM gb_mutatie WHERE admin_key = $1 AND boekjaar = $2 AND ${geenLoonBoekstuk(lonen)} AND datum > current_date
+       GROUP BY dagboek, boekstuk ORDER BY min(datum)`,
+  },
+  {
     id: "onbekende_rekening",
     titel: "Boekingen op onbekende rekeningen",
     uitleg: "Mutaties op een grootboekrekening die niet (meer) in het rekeningschema staat.",
