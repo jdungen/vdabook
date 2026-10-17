@@ -27,31 +27,6 @@ function kader(titel: string, inhoud: string): string {
 <title>${e(titel)}</title><style>${STIJL}</style></head><body><main>${inhoud}</main></body></html>`;
 }
 
-export function toestemmingPagina(o: {
-  verzoek: string;
-  clientNaam: string;
-  redirectHost: string;
-  metWachtwoord: boolean;
-  fout?: string;
-}): string {
-  return kader(
-    "Globe-spiegel koppelen",
-    `<h1>Globe-spiegel koppelen</h1>
-<p><strong>${e(o.clientNaam)}</strong> vraagt leestoegang tot de gespiegelde Exact Globe-administraties. Terugkeer naar <code>${e(o.redirectHost)}</code>.</p>
-${o.fout ? `<p class="fout">${e(o.fout)}</p>` : ""}
-<form method="post" action="/oauth/toestemming" autocomplete="on">
-  <input type="hidden" name="verzoek" value="${e(o.verzoek)}">
-  ${o.metWachtwoord ? `<label for="ww">Wachtwoord</label><input id="ww" name="wachtwoord" type="password" autocomplete="current-password" required>` : ""}
-  <label for="code">Code uit je authenticator</label>
-  <input id="code" name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9 ]{6,7}" required>
-  <div class="knoppen">
-    <button class="nee" name="besluit" value="weigeren" formnovalidate>Weigeren</button>
-    <button class="ja" name="besluit" value="toestaan">Toestaan</button>
-  </div>
-</form>`,
-  );
-}
-
 export function foutPagina(melding: string): string {
   return kader("Globe-spiegel", `<h1>Globe-spiegel</h1><p class="fout">${e(melding)}</p>`);
 }

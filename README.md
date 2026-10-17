@@ -4,8 +4,8 @@ Inzicht in de Exact Globe+-administraties van de familiebedrijven (Van Dungen Au
 
 ```
 [pc Automaten]                                  [Railway]
-Exact Globe+ (SQL Server) -- agent/ --push-->  server/  (Postgres-spiegel, portaal, MCP)
+Exact Globe+ (SQL Server) -- agent --push-->  server/  (Postgres-spiegel, portaal, MCP)
 ```
 
-- `agent/` — PowerShell-agent voor de Globe-pc. `Installeer.ps1` eenmalig als beheerder.
-- `server/` — Node/Express op Railway: ontvangt de spiegel, portaal, MCP voor Claude.
+- `server/agent/` — PowerShell-agent voor de Globe-pc. `Installeer.ps1` eenmalig als beheerder.
+- `server/` — Node/Express op Railway (root `server/`): ontvangt de spiegel, portaal met accounts en audit, MCP voor Claude.

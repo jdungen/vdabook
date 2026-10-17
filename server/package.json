@@ -16,12 +16,14 @@
     "@modelcontextprotocol/sdk": "^1.30.0",
     "express": "^5.1.0",
     "pg": "^8.13.1",
+    "qrcode": "^1.5.4",
     "zod": "^3.24.1"
   },
   "devDependencies": {
     "@types/express": "^5.0.0",
     "@types/node": "^22.10.0",
     "@types/pg": "^8.11.10",
+    "@types/qrcode": "^1.5.5",
     "typescript": "^5.7.2"
   }
 }

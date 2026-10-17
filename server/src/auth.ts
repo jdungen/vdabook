@@ -165,3 +165,125 @@ export function otpauthUri(secret: string, account: string, uitgever: string): s
   );
 }
 
+export interface Sessie {
+  /** Gebruiker. */
+  uid: number;
+  /** Sessieversie van de gebruiker; ophogen trekt alle sessies van die gebruiker in. */
+  v: number;
+  /** Aflooptijd in milliseconden sinds epoch. */
+  exp: number;
+}
+
+/**
+ * Een sessiecookie is de payload plus een HMAC eroverheen.
+ *
+ * Geen sessietabel: het cookie draagt gebruiker en sessieversie. Een account
+ * uitschakelen of zijn sessieversie ophogen maakt elk uitstaand cookie van die
+ * gebruiker ongeldig; SESSION_SECRET wisselen maakt alle sessies ongeldig.
+ */
+export function maakSessie(secret: string, uid: number, v: number, geldigMs: number): string {
+  const payload = JSON.stringify({ uid, v, exp: Date.now() + geldigMs } satisfies Sessie);
+  const body = Buffer.from(payload).toString("base64url");
+  return `${body}.${teken(secret, body)}`;
+}
+
+export function leesSessie(secret: string, cookie: string | undefined): Sessie | null {
+  if (!cookie) return null;
+  const punt = cookie.lastIndexOf(".");
+  if (punt < 1) return null;
+
+  const body = cookie.slice(0, punt);
+  const handtekening = cookie.slice(punt + 1);
+  if (!gelijk(Buffer.from(handtekening), Buffer.from(teken(secret, body)))) return null;
+
+  try {
+    const sessie = JSON.parse(Buffer.from(body, "base64url").toString("utf8")) as Sessie;
+    if (typeof sessie.exp !== "number" || sessie.exp < Date.now() || typeof sessie.uid !== "number") return null;
+    return sessie;
+  } catch {
+    return null;
+  }
+}
+
+const teken = (secret: string, body: string) =>
+  createHmac("sha256", secret).update(body).digest("base64url");
+
+/* ---------------------------------------------------------------- cookies */
+
+export function leesCookies(header: string | undefined): Record<string, string> {
+  const uit: Record<string, string> = {};
+  for (const deel of (header ?? "").split(";")) {
+    const i = deel.indexOf("=");
+    if (i < 1) continue;
+    uit[deel.slice(0, i).trim()] = decodeURIComponent(deel.slice(i + 1).trim());
+  }
+  return uit;
+}
+
+export function cookieRegel(
+  naam: string,
+  waarde: string,
+  opties: { maxAge?: number; secure: boolean },
+): string {
+  const delen = [
+    `${naam}=${encodeURIComponent(waarde)}`,
+    "Path=/",
+    "HttpOnly",
+    // Lax blokkeert het meesturen van dit cookie bij een POST vanaf een andere
+    // site. Dat is de kern van de CSRF-afweer; de herkomstcontrole in core.ts
+    // is de tweede grendel.
+    "SameSite=Lax",
+  ];
+  if (opties.secure) delen.push("Secure");
+  delen.push(`Max-Age=${Math.max(0, Math.floor(opties.maxAge ?? 0))}`);
+  return delen.join("; ");
+}
+
+/* --------------------------------------------------------- brute force */
+
+/**
+ * Teller voor mislukte inlogpogingen per afzender.
+ *
+ * In geheugen, want er is één proces. Bij meerdere replicas zou elke replica
+ * zijn eigen telling houden en is de rem navenant zwakker; dat staat in de
+ * documentatie en niet stilzwijgend in de code.
+ */
+export class Pogingen {
+  private readonly tellers = new Map<string, { n: number; tot: number }>();
+
+  constructor(
+    private readonly drempel = 5,
+    private readonly vensterMs = 15 * 60_000,
+  ) {}
+
+  /** Mag deze afzender het nu proberen, en zo nee: hoe lang nog niet. */
+  magProberen(sleutel: string): { mag: boolean; wachtSeconden: number } {
+    const t = this.tellers.get(sleutel);
+    if (!t || t.tot < Date.now()) return { mag: true, wachtSeconden: 0 };
+    if (t.n < this.drempel) return { mag: true, wachtSeconden: 0 };
+    return { mag: false, wachtSeconden: Math.ceil((t.tot - Date.now()) / 1000) };
+  }
+
+  mislukt(sleutel: string): void {
+    const nu = Date.now();
+    const t = this.tellers.get(sleutel);
+    if (!t || t.tot < nu) {
+      this.tellers.set(sleutel, { n: 1, tot: nu + this.vensterMs });
+      return;
+    }
+    t.n++;
+    // Elke poging boven de drempel schuift het venster op, zodat doorrammen
+    // de blokkade verlengt in plaats van hem uit te zitten.
+    if (t.n >= this.drempel) t.tot = nu + this.vensterMs;
+  }
+
+  gelukt(sleutel: string): void {
+    this.tellers.delete(sleutel);
+  }
+
+  /** Verlopen tellers opruimen; anders groeit de map met elk nieuw adres. */
+  opruimen(): void {
+    const nu = Date.now();
+    for (const [k, t] of this.tellers) if (t.tot < nu) this.tellers.delete(k);
+  }
+}

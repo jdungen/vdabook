@@ -58,7 +58,7 @@ async function vindAdmin(pool: pg.Pool, wie: string, afgeschermdToestaan: boolea
   const a = kandidaten[0]!;
   if (a.afgeschermd && !afgeschermdToestaan) {
     throw new Error(
-      `${a.bedrijfsnaam ?? a.database_name} is afgeschermd (bv. de pensioen-BV). ` +
+      `${a.bedrijfsnaam ?? a.database_name} is in het beheer afgeschermd. ` +
         `Alleen opvragen als Jan daar in dit gesprek uitdrukkelijk om vraagt; zet dan afgeschermd_bevestigd op true.`,
     );
   }
@@ -81,7 +81,7 @@ export function registerTools(server: McpServer, pool: pg.Pool): void {
     "globe_administraties",
     {
       title: "Globe-administraties en syncstatus",
-      description: `Geeft de Exact Globe-administraties in de spiegel (Van Dungen Automaten, Drie D Holding, STAK, Van Dungen Pensioen), met per tabel het aantal rijen en wanneer de agent op de pc bij Automaten voor het laatst heeft gesynchroniseerd.
+      description: `Geeft de Exact Globe-administraties in de spiegel (Van Dungen Automaten, Drie D Holding, STAK Familiefonds, Van Dungen Pensioen), met per tabel het aantal rijen en wanneer de agent op de pc bij Automaten voor het laatst heeft gesynchroniseerd.
 
 Roep dit als eerste aan. De spiegel is zo vers als de laatste sync: de pc staat niet altijd aan, dus noem de syncdatum als die ouder is dan een dag.`,
       inputSchema: {},
@@ -238,7 +238,7 @@ Returns: mutaties nieuwste eerst, maximaal 'limiet'.`,
       description: `Voert één SELECT uit op de Postgres-spiegel, in een READ ONLY-transactie met een tijdslimiet van 20 seconden en maximaal 500 rijen.
 
 Beschikbaar:
-- v_grootboekmutaties (admin_key, bedrijfsnaam, afgeschermd, boekjaar, periode, dagboek, boekstuk, grootboek, datum, omschrijving, bedrag, debiteur, crediteur, factuurnr, kostenplaats, btw_code, transtype, data)
+- v_grootboekmutaties (admin_key, bedrijfsnaam, afgeschermd, boekjaar, periode, dagboek, boekstuk, grootboek, datum, omschrijving, bedrag, debiteur, crediteur, factuurnr, kostenplaats, btw_code, transtype, gebruiker (Globe syscreator), geboekt_op (syscreated))
 - v_grootboekrekeningen (admin_key, bedrijfsnaam, grootboek, omschrijving, balans_of_wv, debet_credit, data)
 - v_relaties (admin_key, bedrijfsnaam, id, code, naam, debiteur, crediteur, soort, data)
 - globe_row (admin_key, tbl, pk, data jsonb) — elke gespiegelde Globe-tabel, kolommen als data->>'kolom'

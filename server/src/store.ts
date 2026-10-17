@@ -36,7 +36,7 @@ export class Store {
 
   constructor(
     connectionString: string,
-    private readonly afschermPatroon: RegExp,
+    private readonly afschermPatroon: RegExp | null,
     /** Tabellen die de agent niet hoeft te sturen (naam, kleine letters). */
     private readonly overslaanPatroon: RegExp | null = null,
   ) {
@@ -75,7 +75,8 @@ export class Store {
 
       for (const a of admins) {
         const afgeschermd =
-          this.afschermPatroon.test(a.bedrijfsnaam ?? "") || this.afschermPatroon.test(a.database);
+          !!this.afschermPatroon &&
+          (this.afschermPatroon.test(a.bedrijfsnaam ?? "") || this.afschermPatroon.test(a.database));
         // afgeschermd wordt alleen áángezet door de automaat; uitzetten is een
         // bewuste handeling in de database, niet iets wat een naamswijziging doet.
         await client.query(

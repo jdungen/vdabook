@@ -7,9 +7,11 @@ import { metadataHandler } from "@modelcontextprotocol/sdk/server/auth/handlers/
 import { Fout, Store, type AdminMelding } from "./store.js";
 import { OAuthOpslag } from "./oauth-opslag.js";
 import { GlobeOAuth, SCOPE } from "./oauth.js";
-import { controleerTotp, controleerWachtwoord } from "./auth.js";
 import { registerTools } from "./tools.js";
-import { toestemmingPagina, foutPagina } from "./pagina.js";
+import { foutPagina } from "./pagina.js";
+import { Kluis } from "./kluis.js";
+import { Gebruikers } from "./portaal/gebruikers.js";
+import { portaal } from "./portaal/routes.js";
 
 /**
  * Globe-spiegel.
@@ -18,7 +20,8 @@ import { toestemmingPagina, foutPagina } from "./pagina.js";
  *               rijen naartoe (bearer AGENT_TOKEN). De pc zelf is nergens van
  *               buitenaf bereikbaar.
  * - /mcp      : leestools voor Claude (OAuth voor claude.ai, of MCP_AUTH_TOKEN).
- * - /oauth/*  : toestemmingsscherm, beveiligd met wachtwoord + TOTP.
+ * - /oauth/*  : OAuth voor claude.ai; toestemming door een ingelogde beheerder + TOTP.
+ * - overige   : het portaal (inzicht, audit, beheer) met eigen accounts.
  *
  * Er bestaat geen code-pad dat iets naar Globe terugschrijft.
  */
@@ -35,9 +38,9 @@ const DATABASE_URL = vereist("DATABASE_URL");
 const AGENT_TOKEN = vereist("AGENT_TOKEN", 32);
 const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN && process.env.MCP_AUTH_TOKEN.length >= 32 ? process.env.MCP_AUTH_TOKEN : null;
 const PUBLIC_URL = process.env.PUBLIC_URL?.replace(/\/+$/, "") ?? (process.env.RAILWAY_PUBLIC_DOMAIN ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}` : undefined);
-const TOTP_SECRET = process.env.TOTP_SECRET;
-const AUTH_PASSWORD_HASH = process.env.AUTH_PASSWORD_HASH;
-const AFSCHERM = new RegExp(process.env.AFSCHERM_PATROON ?? "pensioen", "i");
+const SESSION_SECRET = vereist("SESSION_SECRET", 32);
+const SLEUTEL_KLUIS = vereist("SLEUTEL_KLUIS", 32);
+const AFSCHERM = process.env.AFSCHERM_PATROON ? new RegExp(process.env.AFSCHERM_PATROON, "i") : null;
 
 /** Vergelijking in constante tijd, ongeacht lengte. */
 function tokenGelijk(gegeven: string, verwacht: string): boolean {
@@ -152,9 +155,11 @@ const OAUTH_REDIRECTS = (
 let oauth: GlobeOAuth | null = null;
 let resourceMetadataUrl: string | null = null;
 
-if (PUBLIC_URL && TOTP_SECRET) {
+let oauthOpslag: OAuthOpslag | null = null;
+if (PUBLIC_URL) {
   const resourceUrl = new URL("/mcp", PUBLIC_URL);
   const opslag = new OAuthOpslag(DATABASE_URL);
+  oauthOpslag = opslag;
   oauth = new GlobeOAuth(opslag, {
     resourceUrl,
     coreUrl: new URL(PUBLIC_URL),
@@ -183,82 +188,6 @@ if (PUBLIC_URL && TOTP_SECRET) {
     }),
   );
 
-  // Rem op raden: 5 mislukte pogingen per kwartier per IP.
-  const pogingen = new Map<string, { n: number; tot: number }>();
-  const magProberen = (ip: string) => {
-    const p = pogingen.get(ip);
-    if (!p || p.tot < Date.now()) return true;
-    return p.n < 5;
-  };
-  const mislukt = (ip: string) => {
-    const p = pogingen.get(ip);
-    if (!p || p.tot < Date.now()) pogingen.set(ip, { n: 1, tot: Date.now() + 15 * 60_000 });
-    else p.n += 1;
-  };
-
-  const zekerheidsHeaders = (res: express.Response) =>
-    res.set({
-      "Cache-Control": "no-store",
-      "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'",
-      "X-Content-Type-Options": "nosniff",
-      "Referrer-Policy": "no-referrer",
-    });
-
-  app.get("/oauth/toestemming", async (req, res) => {
-    zekerheidsHeaders(res);
-    const id = typeof req.query.verzoek === "string" ? req.query.verzoek : "";
-    const v = id ? await opslag.verzoekLezen(id) : null;
-    if (!v) {
-      res.status(400).type("html").send(foutPagina("Dit koppelverzoek is onbekend, verlopen of al afgehandeld. Start de koppeling opnieuw vanuit Claude."));
-      return;
-    }
-    res.type("html").send(
-      toestemmingPagina({ verzoek: id, clientNaam: v.clientNaam, redirectHost: new URL(v.redirectUri).host, metWachtwoord: !!AUTH_PASSWORD_HASH }),
-    );
-  });
-
-  app.post("/oauth/toestemming", express.urlencoded({ extended: false, limit: "8kb" }), async (req, res) => {
-    zekerheidsHeaders(res);
-    // Herkomstcontrole in plaats van een CSRF-token: een echte inzending vanaf
-    // deze pagina draagt altijd onze eigen Origin.
-    const origin = req.header("origin");
-    if (!origin || origin !== new URL(PUBLIC_URL).origin) {
-      res.status(403).type("html").send(foutPagina("Verzoek van een onbekende herkomst geweigerd."));
-      return;
-    }
-    const id = String(req.body?.verzoek ?? "");
-    const v = id ? await opslag.verzoekLezen(id) : null;
-    if (!v) {
-      res.status(400).type("html").send(foutPagina("Dit koppelverzoek is onbekend, verlopen of al afgehandeld."));
-      return;
-    }
-    const opnieuw = (melding: string, status: number) =>
-      res.status(status).type("html").send(
-        toestemmingPagina({ verzoek: id, clientNaam: v.clientNaam, redirectHost: new URL(v.redirectUri).host, metWachtwoord: !!AUTH_PASSWORD_HASH, fout: melding }),
-      );
-
-    if (req.body?.besluit === "weigeren") {
-      await opslag.verzoekBesluiten(id, "geweigerd");
-      res.redirect(302, new URL(`/oauth/terug?verzoek=${encodeURIComponent(id)}`, PUBLIC_URL).href);
-      return;
-    }
-    const ip = req.ip ?? "onbekend";
-    if (!magProberen(ip)) return void opnieuw("Te veel mislukte pogingen. Probeer het over een kwartier opnieuw.", 429);
-    const wwOk = !AUTH_PASSWORD_HASH || controleerWachtwoord(String(req.body?.wachtwoord ?? ""), AUTH_PASSWORD_HASH);
-    const codeOk = controleerTotp(TOTP_SECRET, String(req.body?.code ?? ""));
-    if (!wwOk || !codeOk) {
-      mislukt(ip);
-      console.warn(`[oauth] mislukte toestemming vanaf ${ip}`);
-      return void opnieuw("Wachtwoord of code klopt niet.", 401);
-    }
-    if (!(await opslag.verzoekBesluiten(id, "goedgekeurd"))) {
-      res.status(409).type("html").send(foutPagina("Dit verzoek is intussen verlopen of al afgehandeld."));
-      return;
-    }
-    console.log(`[oauth] toegang verleend aan ${v.clientNaam} (${v.clientId})`);
-    res.redirect(302, new URL(`/oauth/terug?verzoek=${encodeURIComponent(id)}`, PUBLIC_URL).href);
-  });
-
   app.get("/oauth/terug", async (req, res) => {
     const id = typeof req.query.verzoek === "string" ? req.query.verzoek : "";
     const doel = id ? await oauth!.afronden(id) : null;
@@ -270,9 +199,9 @@ if (PUBLIC_URL && TOTP_SECRET) {
   });
 
   setInterval(() => void opslag.opruimen().catch((e) => console.error("[oauth] opruimen:", e)), 60 * 60_000).unref();
-  console.log(`[oauth] aan — issuer ${PUBLIC_URL}${AUTH_PASSWORD_HASH ? " (wachtwoord + TOTP)" : " (alleen TOTP)"}`);
+  console.log(`[oauth] aan — issuer ${PUBLIC_URL}; toestemming via de portaalinlog van een beheerder`);
 } else {
-  console.warn("[oauth] uit: PUBLIC_URL of TOTP_SECRET ontbreekt. claude.ai kan zo niet koppelen; MCP_AUTH_TOKEN werkt wel.");
+  console.warn("[oauth] uit: PUBLIC_URL ontbreekt. claude.ai kan zo niet koppelen; MCP_AUTH_TOKEN werkt wel.");
 }
 
 /* -------------------------------------------------------------------- MCP */
@@ -317,9 +246,20 @@ app.all("/mcp", (_req, res) => {
   res.set("Allow", "POST").status(405).json({ jsonrpc: "2.0", error: { code: -32000, message: "Alleen POST wordt ondersteund." }, id: null });
 });
 
-app.get("/", (_req, res) => {
-  res.status(404).json({ hint: "Globe-spiegel. MCP op POST /mcp; de agent praat met /agent/*." });
-});
+/* ----------------------------------------------------------------- portaal */
+
+const gebruikers = new Gebruikers(store.pool, new Kluis(SLEUTEL_KLUIS));
+app.use(
+  portaal({
+    pool: store.pool,
+    gebruikers,
+    sessieGeheim: SESSION_SECRET,
+    publicUrl: PUBLIC_URL,
+    setupCode: process.env.SETUP_CODE,
+    beheerderEmail: process.env.BEHEERDER_EMAIL,
+    oauthOpslag,
+  }),
+);
 
 const port = Number(process.env.PORT ?? 3000);
 const host = process.env.HOST ?? "::";
