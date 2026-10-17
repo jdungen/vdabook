@@ -73,7 +73,7 @@ export class Store {
       await this.pool.query(`GRANT USAGE ON SCHEMA public TO vda_lezer`);
       await this.pool.query(
         `GRANT SELECT ON globe_admin, globe_row, globe_row_historie, globe_sync_state, globe_run, gb_mutatie,
-                         v_grootboekmutaties, v_grootboekrekeningen, v_relaties TO vda_lezer`,
+                         v_grootboekmutaties, v_grootboekrekeningen, v_relaties, jaarrekening_ref TO vda_lezer`,
       );
       const u = new URL(connectionString);
       u.username = "vda_lezer";

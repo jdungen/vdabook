@@ -245,6 +245,7 @@ Beschikbaar:
 - v_relaties (admin_key, bedrijfsnaam, id, code, naam, debiteur, crediteur, soort, data)
 - globe_row (admin_key, tbl, pk, data jsonb) — elke gespiegelde Globe-tabel, kolommen als data->>'kolom'
 - globe_sync_state (per tabel: kolommen, sleutel, watermerk), globe_admin
+- jaarrekening_ref (bedrijf, jaar, post, bedrag, bron): cijfers uit de (concept)jaarrekening om de spiegel op aan te sluiten; post rc:<trefwoord> = rekening-courant met een andere administratie, positief is vordering
 
 Kolomnamen in data zijn de originele Globe-kolommen in kleine letters. Bekijk globe_sync_state.kolommen als je niet weet welke er zijn.
 Deze tool ziet ook afgeschermde administraties; filter op afgeschermd = false tenzij de gebruiker er uitdrukkelijk om vraagt.`,
