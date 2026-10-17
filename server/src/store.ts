@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createHmac } from "node:crypto";
 import pg from "pg";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -48,6 +49,43 @@ export class Store {
     const sql = readFileSync(join(here, "..", "db", "schema.sql"), "utf8");
     await this.pool.query(sql);
     await this.pool.query(`DELETE FROM globe_keyscan WHERE aangemaakt < now() - interval '1 day'`);
+  }
+
+  /**
+   * Aparte databaserol voor de MCP-leestools: geen superuser, standaard
+   * read-only, alleen SELECT op de spiegel (niet op accounts, logboek of
+   * OAuth). Zo kan ook een vrije SQL-vraag geen schade doen of geheimen lezen,
+   * los van wat de applicatie zelf afvangt. Het wachtwoord is afgeleid van een
+   * geheim uit de omgeving en wordt bij elke start opnieuw gezet.
+   * Geeft een pool terug, of null als de rol niet aangemaakt kon worden.
+   */
+  async lezerPool(connectionString: string, geheim: string): Promise<pg.Pool | null> {
+    const ww = createHmac("sha256", geheim).update("vda_lezer").digest("hex");
+    try {
+      await this.pool.query(`DO $$ BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'vda_lezer') THEN CREATE ROLE vda_lezer LOGIN; END IF;
+      END $$`);
+      await this.pool.query(`ALTER ROLE vda_lezer WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD '${ww}'`);
+      await this.pool.query(`ALTER ROLE vda_lezer SET default_transaction_read_only = on`);
+      await this.pool.query(`ALTER ROLE vda_lezer SET statement_timeout = '20s'`);
+      await this.pool.query(`REVOKE CREATE ON SCHEMA public FROM PUBLIC`);
+      await this.pool.query(`REVOKE ALL ON ALL TABLES IN SCHEMA public FROM vda_lezer`);
+      await this.pool.query(`GRANT USAGE ON SCHEMA public TO vda_lezer`);
+      await this.pool.query(
+        `GRANT SELECT ON globe_admin, globe_row, globe_row_historie, globe_sync_state, globe_run, gb_mutatie,
+                         v_grootboekmutaties, v_grootboekrekeningen, v_relaties TO vda_lezer`,
+      );
+      const u = new URL(connectionString);
+      u.username = "vda_lezer";
+      u.password = ww;
+      const p = new pg.Pool({ connectionString: u.toString(), max: 3 });
+      const r = await p.query<{ su: boolean }>(`SELECT rolsuper AS su FROM pg_roles WHERE rolname = current_user`);
+      if (r.rows[0]?.su) throw new Error("vda_lezer is onverwacht superuser");
+      return p;
+    } catch (e) {
+      console.error("[lezer] aparte leesrol niet beschikbaar; de SQL-tool staat uit:", e instanceof Error ? e.message : e);
+      return null;
+    }
   }
 
   async close(): Promise<void> {

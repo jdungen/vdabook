@@ -1,5 +1,6 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type pg from "pg";
+import { createHash } from "node:crypto";
 import { z } from "zod";
 
 /**
@@ -77,6 +78,7 @@ const afgeschermdVeld = z
 const LEES = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false } as const;
 
 export function registerTools(server: McpServer, pool: pg.Pool): void {
+  // `pool` verbindt als vda_lezer (zie Store.lezerPool): read-only, geen superuser.
   server.registerTool(
     "globe_administraties",
     {
@@ -250,11 +252,21 @@ Deze tool ziet ook afgeschermde administraties; filter op afgeschermd = false te
       annotations: LEES,
     },
     async ({ sql }) => {
+      // Precies één statement. Een puntkomma middenin wordt geweigerd, en het
+      // statement gaat als prepared statement (named query): het extended
+      // protocol van Postgres staat dan geen tweede commando toe. Zonder deze
+      // twee kon "SELECT 1) q; COMMIT; …" uit de read-only transactie breken.
+      const enkel = sql.trim().replace(/;\s*$/, "");
+      if (enkel.includes(";")) return fout(new Error("Eén SELECT per keer; puntkomma's zijn niet toegestaan."));
       const client = await pool.connect();
       try {
         await client.query("BEGIN READ ONLY");
         await client.query("SET LOCAL statement_timeout = '20s'");
-        const res = await client.query({ text: `SELECT * FROM (${sql.replace(/;\s*$/, "")}) AS q LIMIT 500` });
+        const res = await client.query({
+          name: `globe_sql_${createHash("sha1").update(enkel).digest("hex").slice(0, 16)}`,
+          text: `SELECT * FROM (${enkel}) AS q LIMIT 500`,
+          values: [],
+        });
         await client.query("ROLLBACK");
         return tekst({ rijen: res.rowCount, data: res.rows });
       } catch (e) {

@@ -75,6 +75,10 @@ if (process.env.OPSCHONEN_GEBRUIKER) {
   console.warn(`[opschonen] gebruiker ${e}: ${g.rowCount} account, ${l.rowCount} logregels verwijderd`);
 }
 
+// MCP-leestools draaien als vda_lezer; lukt dat niet, dan geen MCP-leestoegang
+// tot de database via een rol met meer rechten.
+const lezer = await store.lezerPool(DATABASE_URL, process.env.SESSION_SECRET ?? AGENT_TOKEN);
+
 const app = express();
 app.set("trust proxy", 1);
 app.disable("x-powered-by");
@@ -243,7 +247,11 @@ app.post("/mcp", express.json({ limit: "1mb" }), async (req, res) => {
     return;
   }
   const server = new McpServer({ name: "globe-spiegel", version: "1.0.0" });
-  registerTools(server, store.pool);
+  if (!lezer) {
+    res.status(503).json({ jsonrpc: "2.0", error: { code: -32603, message: "Leestoegang tijdelijk niet beschikbaar (leesrol ontbreekt)." }, id: null });
+    return;
+  }
+  registerTools(server, lezer);
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
   res.on("close", () => {
     void transport.close();

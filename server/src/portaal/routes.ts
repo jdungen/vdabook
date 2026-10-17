@@ -158,7 +158,11 @@ ${o2.fout ? `<div class="bericht mis">${esc(o2.fout)}</div>` : ""}
 
   r.post("/uitloggen", async (req, res) => {
     const gb = await huidig(req);
-    if (gb) await g.log({ g: gb, actie: "uitloggen", ip: req.ip });
+    if (gb) {
+      // Sessieversie ophogen: een bewaard of onderschept cookie werkt daarna niet meer.
+      await g.intrekken(gb.id);
+      await g.log({ g: gb, actie: "uitloggen", ip: req.ip });
+    }
     res.set("Set-Cookie", cookieRegel(SESSIE_COOKIE, "", { maxAge: 0, secure: isHttps(req) })).redirect(303, "/login");
   });
 
@@ -446,15 +450,15 @@ ${wie.length ? `<div class="kaart schuif"><table class="lijst"><tr><th>Gebruiker
     const db = a.slug;
     const balans = b.rijen.filter((x: any) => (x.bal_vw ?? "B") === "B" && (Math.abs(Number(x.saldo ?? 0)) > 0.004 || Math.abs(Number(x.vorig ?? 0)) > 0.004));
     const wv = b.rijen.filter((x: any) => x.bal_vw === "W");
-    const resultaat = -wv.reduce((t: number, x: any) => t + Number(x.saldo ?? 0) - (b.methode === "cumulatief" ? 0 : 0), 0);
+    // Zelfde selectie als de balansrekeningen (jaar, periode, methode): dan sluit het per definitie.
+    const resultaat = -wv.reduce((t: number, x: any) => t + Number(x.saldo ?? 0), 0);
     const debet = balans.filter((x: any) => Number(x.saldo) > 0);
     const credit = balans.filter((x: any) => Number(x.saldo) < 0);
     const som = (l: any[], k = "saldo") => l.reduce((t, x) => t + Number(x[k] ?? 0), 0);
     const rij = (x: any) =>
       `<tr><td>${rekLink(db, x.grootboek, jaar)}</td><td>${esc(x.omschrijving ?? "")}</td>${bedragCel(Math.abs(Number(x.saldo ?? 0)))}${bedragCel(x.vorig === null ? null : Math.abs(Number(x.vorig)))}</tr>`;
-    // Bij cumulatieve methode zit het resultaat van alle jaren in de W-rekeningen; alleen dit jaar tonen we apart.
-    const resJaar = (await rapport.kerncijfers(a.admin_key, jaar)).resultaat ?? 0;
-    const controle = som(balans) + (b.methode === "beginbalans" ? -Number(resJaar) : -resultaat);
+    const controle = som(balans) - resultaat;
+    const resLabel = b.methode === "beginbalans" ? "Resultaat lopend boekjaar" : "Resultaat (nog niet verdeeld, alle jaren tot en met dit jaar)";
 
     await log(req, "bekijk_balans", a.admin_key, { jaar, per });
     res.type("html").send(
@@ -467,8 +471,8 @@ ${wie.length ? `<div class="kaart schuif"><table class="lijst"><tr><th>Gebruiker
 <div class="kaart schuif"><table class="lijst"><tr class="kop"><td colspan="4">Debet (activa)</td></tr><tr><th>Rek.</th><th>Omschrijving</th><th class="r">${jaar}</th><th class="r">${jaar - 1}</th></tr>${debet.map(rij).join("")}
 <tr class="totaal"><td colspan="2">Totaal</td>${bedragCel(som(debet))}<td></td></tr></table></div>
 <div class="kaart schuif"><table class="lijst"><tr class="kop"><td colspan="4">Credit (passiva)</td></tr><tr><th>Rek.</th><th>Omschrijving</th><th class="r">${jaar}</th><th class="r">${jaar - 1}</th></tr>${credit.map(rij).join("")}
-<tr><td></td><td>Resultaat lopend boekjaar</td>${bedragCel(resJaar)}<td></td></tr>
-<tr class="totaal"><td colspan="2">Totaal</td>${bedragCel(-som(credit) + Number(resJaar))}<td></td></tr></table></div>
+<tr><td></td><td>${esc(resLabel)}</td>${bedragCel(resultaat)}<td></td></tr>
+<tr class="totaal"><td colspan="2">Totaal</td>${bedragCel(-som(credit) + resultaat)}<td></td></tr></table></div>
 </div>
 ${Math.abs(controle) > 0.01 ? `<div class="bericht let">Debet en credit sluiten niet: verschil ${euro(controle)}. Zie Audit › Boekstukken die niet in balans zijn.</div>` : `<div class="bericht ok">Debet en credit sluiten.</div>`}`,
       ),
@@ -588,7 +592,7 @@ ${rijen ? `<div class="kaart schuif"><table class="lijst"><tr><th>Datum</th><th>
     const { jaar, jaren } = await jaarUit(req, a.admin_key);
     const info = (await rapport.rekeningen(a.admin_key)).get(rek);
     const verborgen = !req.g!.lonen && new RegExp((await import("./rapport.js")).LOON_REKENING, "i").test(info?.omschrijving ?? "");
-    const k = verborgen ? { beginsaldo: 0, rijen: [] } : await rapport.grootboekkaart(a.admin_key, rek, jaar);
+    const k = verborgen ? { beginsaldo: 0, rijen: [] } : await rapport.grootboekkaart(a.admin_key, rek, jaar, req.g!.lonen);
     await log(req, "bekijk_grootboek", a.admin_key, { rek, jaar });
     const eind = k.rijen.length ? Number((k.rijen[k.rijen.length - 1] as any).lopend) + k.beginsaldo : k.beginsaldo;
     res.type("html").send(
@@ -599,7 +603,7 @@ ${rijen ? `<div class="kaart schuif"><table class="lijst"><tr><th>Datum</th><th>
 ${verborgen ? `<div class="bericht let">Dit is een loon- of personeelsrekening. De regels zijn voor jouw account verborgen; het saldo staat in balans en resultaat.</div>` : `
 <div class="kaart schuif"><table class="lijst"><tr><th>Datum</th><th>Boekstuk</th><th>Omschrijving</th><th>Relatie</th><th class="r">Bedrag</th><th class="r">Saldo</th></tr>
 <tr class="kop"><td colspan="5">Beginsaldo</td>${bedragCel(k.beginsaldo)}</tr>
-${(k.rijen as any[]).map((x) => `<tr><td>${datum(x.datum)}</td><td>${boekstukLink(db, x.dagboek, x.boekstuk)}</td><td>${esc(x.omschrijving ?? "")}</td><td class="mono">${esc(x.debiteur ?? x.crediteur ?? "")}</td>${bedragCel(x.bedrag)}${bedragCel(Number(x.lopend) + k.beginsaldo)}</tr>`).join("")}
+${(k.rijen as any[]).map((x) => `<tr><td>${datum(x.datum)}</td><td>${x.samengevat ? `<span class="gedempt">periode ${esc(x.periode)}</span>` : boekstukLink(db, x.dagboek, x.boekstuk)}</td><td${x.samengevat ? ' class="gedempt"' : ""}>${esc(x.omschrijving ?? "")}</td><td class="mono">${esc(x.debiteur ?? x.crediteur ?? "")}</td>${bedragCel(x.bedrag)}${bedragCel(Number(x.lopend) + k.beginsaldo)}</tr>`).join("")}
 <tr class="totaal"><td colspan="5">Eindsaldo</td>${bedragCel(eind)}</tr></table></div>`}`,
       ),
     );
@@ -724,7 +728,7 @@ ${rel.length ? `<div class="kaart schuif"><table class="lijst"><tr><th>Naam</th>
     const sorteer = str(req.query.s) ?? null;
     const pagina = Math.max(int(req.query.p) ?? 0, 0);
     const csvExport = req.query.formaat === "csv";
-    const t = await rapport.tabel(a.admin_key, tbl, zoek, sorteer, csvExport ? 200_000 : 50, csvExport ? 0 : pagina * 50);
+    const t = await rapport.tabel(a.admin_key, tbl, zoek, sorteer, csvExport ? 200_000 : 50, csvExport ? 0 : pagina * 50, req.g!.lonen);
     if (csvExport) {
       await log(req, "export_tabel", a.admin_key, { tbl, zoek });
       return res.type("text/csv; charset=utf-8").attachment(`${tbl}-${db}.csv`).send(csv(t.kolommen.map((k) => ({ k, label: k })), t.rijen.map((x: any) => x.data)));

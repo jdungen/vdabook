@@ -183,6 +183,11 @@ export class Gebruikers {
     }
   }
 
+  /** Alle lopende sessies van deze gebruiker ongeldig maken. */
+  async intrekken(id: number): Promise<void> {
+    await this.pool.query(`UPDATE portaal_gebruiker SET sessie_versie = sessie_versie + 1 WHERE id = $1`, [id]);
+  }
+
   /** Uitschakelen: account blijft (voor het logboek), alle sessies vervallen. */
   async uitschakelen(id: number): Promise<void> {
     await this.pool.query(

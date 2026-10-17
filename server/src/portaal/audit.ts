@@ -37,6 +37,13 @@ const REK = `rek AS (SELECT trim(data->>'reknr') AS grootboek, data->>'oms25_0' 
 const BEGIN = `begin AS (SELECT EXISTS (SELECT 1 FROM gb_mutatie WHERE admin_key = $1 AND boekjaar = $2 AND periode = 0) AS ja)`;
 const SALDO_TOT_JAAR = `CASE WHEN (SELECT ja FROM begin) THEN m.boekjaar = $2 ELSE m.boekjaar <= $2 END`;
 const RUIS = `('timestamp', 'sysmodified', 'sysmodifier', 'sysguid', 'syscreated', 'syscreator')`;
+/** Boekstuk (alias m) zonder regels op loonrekeningen; voor controles die per boekstuk tonen. */
+const geenLoonBoekstuk = (lonen: boolean, m = "gb_mutatie") =>
+  lonen
+    ? "TRUE"
+    : `NOT EXISTS (SELECT 1 FROM gb_mutatie lx JOIN globe_row lr ON lr.admin_key = lx.admin_key AND lr.tbl = 'grtbk' AND trim(lr.data->>'reknr') = lx.grootboek
+                    WHERE lx.admin_key = ${m}.admin_key AND lx.dagboek = ${m}.dagboek AND lx.boekstuk = ${m}.boekstuk
+                      AND COALESCE(lr.data->>'oms25_0', '') ~* '${LOON_REKENING}')`;
 const zonderLonen = (lonen: boolean, kolom: string) => (lonen ? "TRUE" : `NOT (COALESCE(${kolom}, '') ~* '${LOON_REKENING}')`);
 
 export const CONTROLES: Controle[] = [
@@ -78,7 +85,7 @@ export const CONTROLES: Controle[] = [
       { k: "tarief", label: "Tarief" },
       { k: "signaal", label: "Signaal" },
     ],
-    sql: () => `WITH ${REK},
+    sql: (lonen) => `WITH ${REK},
       btwrek AS (SELECT grootboek,
                         CASE WHEN go ~* '(te vorderen|voorbelasting)' THEN 'inkoop'
                              WHEN go ~* '(af te dragen|verschuldigd|te betalen|omzetbelasting|verlegd)' THEN 'verkoop'
@@ -91,7 +98,7 @@ export const CONTROLES: Controle[] = [
                sum(m.bedrag) FILTER (WHERE b.kant = 'verkoop') AS btw_verkoop,
                sum(m.bedrag) FILTER (WHERE m.btw_code IS NOT NULL AND b.grootboek IS NULL) AS grondslag
           FROM gb_mutatie m LEFT JOIN btwrek b ON b.grootboek = m.grootboek
-         WHERE m.admin_key = $1 AND m.boekjaar = $2 AND m.periode <> 0
+         WHERE m.admin_key = $1 AND m.boekjaar = $2 AND m.periode <> 0 AND ${geenLoonBoekstuk(lonen, "m")}
          GROUP BY m.dagboek, m.boekstuk),
       sig AS (
         SELECT *, CASE
@@ -119,9 +126,9 @@ export const CONTROLES: Controle[] = [
       { k: "regels", label: "Regels", soort: "getal" },
       { k: "transtypes", label: "Transactiesoort" },
     ],
-    sql: () => `SELECT dagboek, boekstuk, dagboek || '|' || boekstuk AS sleutel, min(datum) AS datum,
+    sql: (lonen) => `SELECT dagboek, boekstuk, dagboek || '|' || boekstuk AS sleutel, min(datum) AS datum,
              round(sum(bedrag), 2) AS verschil, count(*) AS regels, string_agg(DISTINCT transtype, ', ') AS transtypes
-        FROM gb_mutatie WHERE admin_key = $1 AND boekjaar = $2
+        FROM gb_mutatie WHERE admin_key = $1 AND boekjaar = $2 AND ${geenLoonBoekstuk(lonen)}
        GROUP BY dagboek, boekstuk HAVING abs(sum(bedrag)) > 0.005
        ORDER BY abs(sum(bedrag)) DESC`,
   },
@@ -136,7 +143,7 @@ export const CONTROLES: Controle[] = [
       { k: "tot", label: "Tot en met", soort: "tekst" },
       { k: "aantal", label: "Ontbrekend", soort: "getal" },
     ],
-    sql: () => `WITH n AS (SELECT DISTINCT dagboek, boekstuk::bigint AS nr FROM gb_mutatie
+    sql: (lonen) => `WITH n AS (SELECT DISTINCT dagboek, boekstuk::bigint AS nr FROM gb_mutatie
                          WHERE admin_key = $1 AND boekjaar = $2 AND boekstuk ~ '^\\d{1,15}$'),
            g AS (SELECT dagboek, nr, lead(nr) OVER (PARTITION BY dagboek ORDER BY nr) AS volgende FROM n)
       SELECT dagboek, (nr + 1)::text AS van, (volgende - 1)::text AS tot, volgende - nr - 1 AS aantal,
@@ -168,6 +175,10 @@ export const CONTROLES: Controle[] = [
         LEFT JOIN (SELECT trim(data->>'reknr') AS grootboek, data->>'oms25_0' AS go FROM globe_row WHERE admin_key = $1 AND tbl = 'grtbk') rek
                ON rek.grootboek = trim(h.data_oud->>'reknr')
        WHERE h.admin_key = $1 AND h.tbl = 'gbkmut' AND h.soort = 'gewijzigd'
+         AND ${lonen ? "TRUE" : `COALESCE(h.data_oud->>'oms25', '') !~* '${LOON_REKENING}' AND NOT EXISTS (
+               SELECT 1 FROM gb_mutatie lx JOIN globe_row lr ON lr.admin_key = lx.admin_key AND lr.tbl = 'grtbk' AND trim(lr.data->>'reknr') = lx.grootboek
+                WHERE lx.admin_key = h.admin_key AND lx.dagboek = trim(h.data_oud->>'dagbknr') AND lx.boekstuk = trim(h.data_oud->>'bkstnr')
+                  AND COALESCE(lr.data->>'oms25_0', '') ~* '${LOON_REKENING}')`}
          AND vda_int(h.data_oud->>'bkjrcode') = $2 AND d.velden IS NOT NULL
          AND ${zonderLonen(lonen, "rek.go")}
        ORDER BY h.gemerkt_op DESC`,
@@ -193,6 +204,10 @@ export const CONTROLES: Controle[] = [
         LEFT JOIN (SELECT trim(data->>'reknr') AS grootboek, data->>'oms25_0' AS go FROM globe_row WHERE admin_key = $1 AND tbl = 'grtbk') rek
                ON rek.grootboek = trim(h.data_oud->>'reknr')
        WHERE h.admin_key = $1 AND h.tbl = 'gbkmut' AND h.soort = 'verwijderd' AND vda_int(h.data_oud->>'bkjrcode') = $2
+         AND ${lonen ? "TRUE" : `COALESCE(h.data_oud->>'oms25', '') !~* '${LOON_REKENING}' AND NOT EXISTS (
+               SELECT 1 FROM gb_mutatie lx JOIN globe_row lr ON lr.admin_key = lx.admin_key AND lr.tbl = 'grtbk' AND trim(lr.data->>'reknr') = lx.grootboek
+                WHERE lx.admin_key = h.admin_key AND lx.dagboek = trim(h.data_oud->>'dagbknr') AND lx.boekstuk = trim(h.data_oud->>'bkstnr')
+                  AND COALESCE(lr.data->>'oms25_0', '') ~* '${LOON_REKENING}')`}
          AND ${zonderLonen(lonen, "rek.go")}
        ORDER BY h.gemerkt_op DESC`,
   },
@@ -208,11 +223,11 @@ export const CONTROLES: Controle[] = [
       { k: "gebruiker", label: "Gebruiker" },
       { k: "omvang", label: "Omvang", soort: "bedrag" },
     ],
-    sql: () => `SELECT dagboek, boekstuk, dagboek || '|' || boekstuk AS sleutel,
+    sql: (lonen) => `SELECT dagboek, boekstuk, dagboek || '|' || boekstuk AS sleutel,
              COALESCE(min(geboekt_op), min(datum)::timestamp) AS moment,
              CASE WHEN min(geboekt_op) IS NOT NULL THEN 'invoertijdstip' ELSE 'boekdatum' END AS grondslag,
              min(gebruiker) AS gebruiker, round(sum(abs(bedrag)) / 2, 2) AS omvang
-        FROM gb_mutatie WHERE admin_key = $1 AND boekjaar = $2 AND periode <> 0
+        FROM gb_mutatie WHERE admin_key = $1 AND boekjaar = $2 AND ${geenLoonBoekstuk(lonen)} AND periode <> 0
        GROUP BY dagboek, boekstuk
       HAVING CASE WHEN min(geboekt_op) IS NOT NULL
                   THEN extract(isodow FROM min(geboekt_op)) >= 6 OR extract(hour FROM min(geboekt_op)) >= 20 OR extract(hour FROM min(geboekt_op)) < 7
@@ -237,7 +252,7 @@ export const CONTROLES: Controle[] = [
        WHERE m.admin_key = $1 AND m.boekjaar = $2 AND m.periode <> 0
          AND abs(m.bedrag) >= 1000 AND mod(abs(m.bedrag), 500) = 0
          AND COALESCE(rek.go, '') !~* '(bank|\\mkas\\M|rabo|abn|knab|giro)'
-         AND ${zonderLonen(lonen, "rek.go")}
+         AND ${zonderLonen(lonen, "rek.go")} AND ${geenLoonBoekstuk(lonen, "m")}
        ORDER BY abs(m.bedrag) DESC`,
   },
   {
@@ -251,9 +266,9 @@ export const CONTROLES: Controle[] = [
       { k: "omvang", label: "Omvang", soort: "bedrag" },
       { k: "rekeningen", label: "Rekeningen" },
     ],
-    sql: () => `SELECT dagboek, boekstuk, dagboek || '|' || boekstuk AS sleutel, min(datum) AS datum, min(omschrijving) AS omschrijving,
+    sql: (lonen) => `SELECT dagboek, boekstuk, dagboek || '|' || boekstuk AS sleutel, min(datum) AS datum, min(omschrijving) AS omschrijving,
              round(sum(abs(bedrag)) / 2, 2) AS omvang, string_agg(DISTINCT grootboek, ', ') AS rekeningen
-        FROM gb_mutatie WHERE admin_key = $1 AND boekjaar = $2 AND periode <> 0
+        FROM gb_mutatie WHERE admin_key = $1 AND boekjaar = $2 AND ${geenLoonBoekstuk(lonen)} AND periode <> 0
        GROUP BY dagboek, boekstuk ORDER BY sum(abs(bedrag)) DESC LIMIT 50`,
   },
   {
@@ -267,12 +282,12 @@ export const CONTROLES: Controle[] = [
       { k: "boekstukken", label: "Boekstukken" },
       { k: "bedragen", label: "Bedragen" },
     ],
-    sql: () => `SELECT dagboek, COALESCE(crediteur, debiteur) AS relatie, factuurnr,
+    sql: (lonen) => `SELECT dagboek, COALESCE(crediteur, debiteur) AS relatie, factuurnr,
              dagboek || '|' || COALESCE(crediteur, debiteur) || '|' || factuurnr AS sleutel,
              string_agg(DISTINCT boekstuk, ', ') AS boekstukken,
              string_agg(DISTINCT replace(to_char(bedrag, 'FM9999999990.00'), '.', ','), ' / ') AS bedragen
         FROM gb_mutatie
-       WHERE admin_key = $1 AND boekjaar = $2 AND factuurnr IS NOT NULL AND COALESCE(crediteur, debiteur) IS NOT NULL
+       WHERE admin_key = $1 AND boekjaar = $2 AND ${geenLoonBoekstuk(lonen)} AND factuurnr IS NOT NULL AND COALESCE(crediteur, debiteur) IS NOT NULL
        GROUP BY dagboek, COALESCE(crediteur, debiteur), factuurnr
       HAVING count(DISTINCT boekstuk) > 1
        ORDER BY dagboek, relatie`,
@@ -289,9 +304,9 @@ export const CONTROLES: Controle[] = [
       { k: "omvang", label: "Omvang", soort: "bedrag" },
       { k: "omschrijving", label: "Omschrijving" },
     ],
-    sql: () => `SELECT dagboek, boekstuk, dagboek || '|' || boekstuk AS sleutel, min(datum) AS datum, min(periode) AS periode,
+    sql: (lonen) => `SELECT dagboek, boekstuk, dagboek || '|' || boekstuk AS sleutel, min(datum) AS datum, min(periode) AS periode,
              round(sum(abs(bedrag)) / 2, 2) AS omvang, min(omschrijving) AS omschrijving
-        FROM gb_mutatie WHERE admin_key = $1 AND boekjaar = $2 AND periode <> 0 AND extract(year FROM datum) <> boekjaar
+        FROM gb_mutatie WHERE admin_key = $1 AND boekjaar = $2 AND ${geenLoonBoekstuk(lonen)} AND periode <> 0 AND extract(year FROM datum) <> boekjaar
        GROUP BY dagboek, boekstuk ORDER BY min(datum)`,
   },
   {

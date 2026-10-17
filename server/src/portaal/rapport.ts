@@ -18,6 +18,34 @@ export const LOON_TABEL = /^(humres|hr|hrm|loon|lon_|salar|sal_|pay|prl|emp|abse
 const zonderLonen = (lonen: boolean, alias = "go") =>
   lonen ? "TRUE" : `NOT (COALESCE(${alias}, '') ~* '${LOON_REKENING}')`;
 
+/**
+ * SQL-voorwaarde: de rij (uit globe_row, alias r) is géén gbkmut-regel op een
+ * loonrekening. Voor de ruwe tabelweergave en de wijzigingenlijst, waar geen
+ * getypeerde join beschikbaar is. `veld` wijst naar de JSON met reknr.
+ */
+export const geenLoonRegel = (lonen: boolean, alias: string, veld: string) =>
+  lonen
+    ? "TRUE"
+    : `NOT (${alias}.tbl = 'gbkmut' AND EXISTS (
+         SELECT 1 FROM gb_mutatie lx
+           JOIN globe_row lr ON lr.admin_key = lx.admin_key AND lr.tbl = 'grtbk' AND trim(lr.data->>'reknr') = lx.grootboek
+          WHERE lx.admin_key = ${alias}.admin_key
+            AND lx.dagboek = nullif(trim(${veld}->>'dagbknr'), '') AND lx.boekstuk = nullif(trim(${veld}->>'bkstnr'), '')
+            AND COALESCE(lr.data->>'oms25_0', '') ~* '${LOON_REKENING}'))
+      AND NOT (${alias}.tbl = 'gbkmut' AND EXISTS (
+         SELECT 1 FROM globe_row lr WHERE lr.admin_key = ${alias}.admin_key AND lr.tbl = 'grtbk'
+            AND trim(lr.data->>'reknr') = trim(${veld}->>'reknr')
+            AND COALESCE(lr.data->>'oms25_0', '') ~* '${LOON_REKENING}'))
+      AND NOT (${alias}.tbl = 'gbkmut' AND COALESCE(${veld}->>'oms25', '') ~* '${LOON_REKENING}')`;
+
+/** Boekstuk (alias m, uit gb_mutatie) zonder regels op loonrekeningen. */
+export const geenLoonBoekstuk = (lonen: boolean, m: string) =>
+  lonen
+    ? "TRUE"
+    : `NOT EXISTS (SELECT 1 FROM gb_mutatie lx JOIN globe_row lr ON lr.admin_key = lx.admin_key AND lr.tbl = 'grtbk' AND trim(lr.data->>'reknr') = lx.grootboek
+                    WHERE lx.admin_key = ${m}.admin_key AND lx.dagboek = ${m}.dagboek AND lx.boekstuk = ${m}.boekstuk
+                      AND COALESCE(lr.data->>'oms25_0', '') ~* '${LOON_REKENING}')`;
+
 export interface RekeningInfo {
   grootboek: string;
   omschrijving: string | null;
@@ -166,7 +194,7 @@ export class Rapport {
           AND ($8::text IS NULL OR m.dagboek = $8)
           AND ($9::text IS NULL OR m.boekstuk = $9)
           AND ($10::text IS NULL OR m.gebruiker = $10)
-          AND ${zonderLonen(lonen, "rek.go")}
+          AND ${zonderLonen(lonen, "rek.go")} AND ${geenLoonBoekstuk(lonen, "m")}
         ORDER BY m.datum DESC NULLS LAST, m.dagboek, m.boekstuk, m.pk
         LIMIT $11 OFFSET $12`,
       [admin, f.grootboek ?? null, f.relatie ?? null, f.zoek ?? null, f.van ?? null, f.tot ?? null, f.jaar ?? null, f.dagboek ?? null, f.boekstuk ?? null, f.gebruiker ?? null, limiet, offset],
@@ -179,20 +207,38 @@ export class Rapport {
   }
 
   /** Grootboekkaart: beginsaldo plus mutaties van het jaar met lopend saldo. */
-  async grootboekkaart(admin: string, rek: string, jaar: number) {
+  async grootboekkaart(admin: string, rek: string, jaar: number, lonen = true) {
     const begin = await this.heeftBeginbalans(admin, jaar);
     const start = await this.pool.query<{ s: string | null }>(
       `SELECT sum(bedrag) AS s FROM gb_mutatie WHERE admin_key = $1 AND grootboek = $2 AND ${begin ? "boekjaar = $3 AND periode = 0" : "boekjaar < $3"}`,
       [admin, rek, jaar],
     );
     const r = await this.pool.query(
-      `SELECT pk, periode, datum, dagboek, boekstuk, omschrijving, bedrag, debiteur, crediteur, factuurnr, gebruiker,
-              sum(bedrag) OVER (ORDER BY datum NULLS FIRST, dagboek, boekstuk, pk) AS lopend
-         FROM gb_mutatie WHERE admin_key = $1 AND grootboek = $2 AND boekjaar = $3 ${begin ? "AND periode <> 0" : ""}
-        ORDER BY datum NULLS FIRST, dagboek, boekstuk, pk`,
+      `SELECT m.pk, m.periode, m.datum, m.dagboek, m.boekstuk, m.omschrijving, m.bedrag, m.debiteur, m.crediteur, m.factuurnr, m.gebruiker,
+              NOT (${geenLoonBoekstuk(lonen, "m")}) AS verborgen,
+              sum(m.bedrag) OVER (ORDER BY m.datum NULLS FIRST, m.dagboek, m.boekstuk, m.pk) AS lopend
+         FROM gb_mutatie m WHERE m.admin_key = $1 AND m.grootboek = $2 AND m.boekjaar = $3 ${begin ? "AND m.periode <> 0" : ""}
+        ORDER BY m.datum NULLS FIRST, m.dagboek, m.boekstuk, m.pk`,
       [admin, rek, jaar],
     );
-    return { beginsaldo: Number(start.rows[0]?.s ?? 0), rijen: r.rows };
+    // Zonder lonen-recht: loonboekingen per periode samenvatten. Het lopende
+    // saldo blijft kloppen, maar geen enkele betaling is herleidbaar.
+    const rijen: any[] = [];
+    for (const x of r.rows as any[]) {
+      if (!x.verborgen) {
+        rijen.push(x);
+        continue;
+      }
+      const vorige = rijen[rijen.length - 1];
+      if (vorige?.samengevat && vorige.periode === x.periode) {
+        vorige.bedrag = Number(vorige.bedrag) + Number(x.bedrag);
+        vorige.lopend = x.lopend;
+        vorige.datum = x.datum;
+      } else {
+        rijen.push({ samengevat: true, periode: x.periode, datum: x.datum, omschrijving: "Loonboekingen (samengevat)", bedrag: Number(x.bedrag), lopend: x.lopend });
+      }
+    }
+    return { beginsaldo: Number(start.rows[0]?.s ?? 0), rijen };
   }
 
   /** Eén boekstuk, alle regels. */
@@ -263,7 +309,7 @@ export class Rapport {
         WHERE r.admin_key = $1 AND r.tbl = 'gbkmut'
           AND s.initieel_klaar IS NOT NULL AND r.eerst_gezien > s.initieel_klaar
           AND r.eerst_gezien > now() - make_interval(days => $2)
-          AND ${zonderLonen(lonen, "rek.go")}
+          AND ${zonderLonen(lonen, "rek.go")} AND ${geenLoonBoekstuk(lonen, "m")}
         GROUP BY 1, 2 ORDER BY 1 DESC, 2`,
       [admin, dagen],
     );
@@ -283,6 +329,7 @@ export class Rapport {
          FROM globe_row_historie
         WHERE admin_key = $1 AND ($2::text IS NULL OR tbl = $2) AND ($3::text IS NULL OR soort = $3)
           AND ($4 OR NOT (tbl ~* $5))
+          AND ${geenLoonRegel(lonen, "globe_row_historie", "globe_row_historie.data_oud")}
         ORDER BY gemerkt_op DESC, id DESC LIMIT $6 OFFSET $7`,
       [admin, tbl, soort, lonen, LOON_TABEL.source, limiet, offset],
     );
@@ -300,7 +347,7 @@ export class Rapport {
     return r.rows;
   }
 
-  async tabel(admin: string, tbl: string, zoek: string | null, sorteer: string | null, limiet: number, offset: number) {
+  async tabel(admin: string, tbl: string, zoek: string | null, sorteer: string | null, limiet: number, offset: number, lonen: boolean) {
     const st = await this.pool.query<{ kolommen: string[]; sleutel: string[] }>(
       `SELECT kolommen, sleutel FROM globe_sync_state WHERE admin_key = $1 AND tbl = $2`,
       [admin, tbl],
@@ -310,11 +357,14 @@ export class Rapport {
     const orde = sk ? `data->>'${sk.replace(/^-/, "").replace(/'/g, "")}' ${sk.startsWith("-") ? "DESC" : "ASC"} NULLS LAST, pk` : "pk";
     const r = await this.pool.query(
       `SELECT pk, data, eerst_gezien, versies, count(*) OVER () AS totaal
-         FROM globe_row WHERE admin_key = $1 AND tbl = $2
+         FROM globe_row r WHERE admin_key = $1 AND tbl = $2
           AND ($3::text IS NULL OR data::text ILIKE '%' || $3 || '%')
+          AND ${geenLoonRegel(lonen, "r", "r.data")}
         ORDER BY ${orde} LIMIT $4 OFFSET $5`,
       [admin, tbl, zoek, limiet, offset],
     );
+    // Kolommen die in de data staan maar (nog) niet in de aanmelding: ook tonen.
+    for (const rij of r.rows) for (const k of Object.keys(rij.data ?? {})) if (!kolommen.includes(k)) kolommen.push(k);
     return { kolommen, rijen: r.rows, aantal: Number(r.rows[0]?.totaal ?? 0) };
   }
 
