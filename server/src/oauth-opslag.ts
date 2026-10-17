@@ -174,7 +174,15 @@ export class OAuthOpslag {
         WHERE code_hash = $1 AND client_id = $2 AND gebruikt_op IS NULL AND verloopt_op > now()`,
       [hash(code), clientId],
     );
-    return rows[0]?.code_challenge ?? null;
+    if (rows[0]) return rows[0].code_challenge;
+    // De SDK vraagt eerst de challenge op en komt bij een al gebruikte code
+    // nooit bij codeInwisselen. Het intrekken bij hergebruik moet dus hier.
+    const { rows: oud } = await this.pool.query<{ familie: string }>(
+      `SELECT familie FROM oauth_codes WHERE code_hash = $1 AND gebruikt_op IS NOT NULL`,
+      [hash(code)],
+    );
+    if (oud[0]) await this.familieIntrekken(oud[0].familie);
+    return null;
   }
 
   /**
