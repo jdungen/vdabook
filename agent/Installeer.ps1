@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   Installeert de VDA Book Globe-sync-agent op de pc met Exact Globe+.
 
@@ -150,7 +150,7 @@ foreach ($inst in $instances) {
   $cred = $null
   try { $c = Verbind $inst $null } catch {
     Let "Windows-aanmelding op $inst mislukt: $($_.Exception.Message)"
-    $cred = Get-Credential -Message "SQL-beheerder voor $inst (bijv. sa) — alleen gebruikt om leesrechten te geven, niet bewaard"
+    $cred = Get-Credential -Message "SQL-beheerder voor $inst (bijv. sa) - alleen gebruikt om leesrechten te geven, niet bewaard"
     $c = Verbind $inst $cred
   }
   try {

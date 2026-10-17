@@ -1,6 +1,6 @@
-<#
+﻿<#
 .SYNOPSIS
-  VDA Book — Globe-sync-agent. Leest de Exact Globe-administraties op deze pc
+  VDA Book - Globe-sync-agent. Leest de Exact Globe-administraties op deze pc
   read-only en duwt ze naar de spiegel op Railway.
 
 .DESCRIPTION
@@ -52,7 +52,7 @@ Get-ChildItem $LogMap -Filter '*.log' -ErrorAction SilentlyContinue |
   Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-14) } |
   Remove-Item -Force -ErrorAction SilentlyContinue
 
-# ------------------------------------------------- één run tegelijk (mutex)
+# ------------------------------------------------- een run tegelijk (mutex)
 
 $mutex = New-Object System.Threading.Mutex($false, 'Global\VDA-GlobeSync')
 if (-not $mutex.WaitOne(0)) {
@@ -132,7 +132,7 @@ function Stuur {
         throw "HTTP $status op $Pad`: $foutTekst"
       }
       if ($poging -ge $wachten.Count) { throw "Server onbereikbaar na $($poging + 1) pogingen ($Pad): $foutTekst" }
-      Log "HTTP-fout op $Pad ($status): $foutTekst — opnieuw over $($wachten[$poging]) s" 'WARN'
+      Log "HTTP-fout op $Pad ($status): $foutTekst - opnieuw over $($wachten[$poging]) s" 'WARN'
       Start-Sleep -Seconds $wachten[$poging]
     }
   }
