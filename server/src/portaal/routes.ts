@@ -13,6 +13,7 @@ import { Rapport, LOON_TABEL, Aansluiting, type OnderlingPaar } from "./rapport.
 type OnderlingRegel = OnderlingPaar["a"][number];
 import { Audit, type Kolom } from "./audit.js";
 import { adminNaam, bedragCel, datum, esc, euro, geleden, getal, kader, losKader, meldingen, qs, tijdstip } from "./ui.js";
+import { datumInvoerNaarIso, datumVeld } from "./datumveld.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const SESSIE_COOKIE = "vda_sessie";
@@ -97,6 +98,9 @@ export function portaal(o: PortaalOpties): express.Router {
     }
     next();
   });
+
+  // dd-mm-jjjj uit datumvelden → jjjj-mm-dd. Geen kalenderscript: deze app staat geen scripts toe (CSP).
+  r.use(datumInvoerNaarIso(() => undefined));
 
   for (const [naam, png] of [["beeldmerk", BEELDMERK_PNG], ["woordmerk", WOORDMERK_PNG], ["icoon", ICOON_PNG]] as const) {
     r.get(`/logo/${naam}.png`, (_req, res) => res.set("Cache-Control", "public, max-age=86400").type("png").send(png));
@@ -614,8 +618,8 @@ ${rijen}
   <label>Relatie<input name="relatie" value="${esc(f.relatie ?? "")}" size="8"></label>
   <label>Dagboek<input name="dagboek" value="${esc(f.dagboek ?? "")}" size="4"></label>
   <label>Boekjaar<select name="jaar"><option value="">alle</option>${jaren.map((j) => `<option${j === f.jaar ? " selected" : ""}>${j}</option>`).join("")}</select></label>
-  <label>Van<input type="date" name="van" value="${esc(f.van ?? "")}"></label>
-  <label>Tot<input type="date" name="tot" value="${esc(f.tot ?? "")}"></label>
+  <label>Van${datumVeld("van", f.van)}</label>
+  <label>Tot${datumVeld("tot", f.tot)}</label>
   ${f.gebruiker ? `<input type="hidden" name="gebruiker" value="${esc(f.gebruiker)}">` : ""}
   <button class="primair">Zoek</button><a class="knop" href="${qs({ ...f, formaat: "csv" })}">CSV</a>
 </form>

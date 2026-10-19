@@ -1,4 +1,5 @@
 import { BASIS } from "./basisstijl.js";
+import { DATUMVELD_STIJL } from "./datumveld.js";
 import type { Admin, Gebruiker } from "./gebruikers.js";
 
 /* ─────────────────────────────────────────────── opmaakhulpjes ── */
@@ -173,6 +174,7 @@ const STIJL = `${BASIS}
     h1 { font-size:1.3rem; }
     input, select, textarea { font-size:16px; }
   }
+${DATUMVELD_STIJL}
 </style>`;
 
 /* ─────────────────────────────────────────────── kop en kader ── */
