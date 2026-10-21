@@ -1,5 +1,6 @@
 import type pg from "pg";
 import { LOON_REKENING } from "./rapport.js";
+import { BANK_CTE } from "./bank.js";
 
 /**
  * Auditcontroles op de Globe-spiegel.
@@ -45,6 +46,12 @@ const geenLoonBoekstuk = (lonen: boolean, m = "gb_mutatie") =>
                     WHERE lx.admin_key = ${m}.admin_key AND lx.dagboek = ${m}.dagboek AND lx.boekstuk = ${m}.boekstuk
                       AND COALESCE(lr.data->>'oms25_0', '') ~* '${LOON_REKENING}')`;
 const zonderLonen = (lonen: boolean, kolom: string) => (lonen ? "TRUE" : `NOT (COALESCE(${kolom}, '') ~* '${LOON_REKENING}')`);
+
+/* Bank: velden uit banktransactions (alias t) en hulpstukken. */
+const BT = (k: string) => `nullif(trim(t.data->>'${k}'), '')`;
+const BT_DATUM = `COALESCE(vda_datum(t.data->>'valuedate'), vda_datum(t.data->>'statementdate'), vda_datum(t.data->>'processingdate'))`;
+const BT_IBAN = `nullif(upper(regexp_replace(COALESCE(t.data->>'offsetbankaccount', ''), '[^A-Za-z0-9]', '', 'g')), '')`;
+const BT_GEEN_TERMIJN = `COALESCE(${BT("type")}, '') <> 'W'`;
 
 export const CONTROLES: Controle[] = [
   {
@@ -339,6 +346,154 @@ export const CONTROLES: Controle[] = [
         FROM gb_mutatie m WHERE m.admin_key = $1 AND m.boekjaar = $2
          AND NOT EXISTS (SELECT 1 FROM rek WHERE rek.grootboek = m.grootboek)
        GROUP BY m.grootboek ORDER BY m.grootboek`,
+  },
+  {
+    id: "bank_niet_geboekt",
+    titel: "Bankregels zonder boeking",
+    uitleg:
+      "Regels uit de bankadministratie van Globe (ingelezen of aangemaakt, geen termijnen) met een bankdatum in dit jaar, ouder dan 14 dagen, waar geen boekstuk of koppeling aan hangt. Geld dat wel over de bank ging maar niet in de boekhouding staat — of andersom: wat de boekhouding mist.",
+    kanttekening: "Een regel kan bewust zijn overgeslagen of op een andere manier verwerkt. De betekenis van type- en statuscodes is die van Globe en staat erbij.",
+    kolommen: [
+      { k: "datum", label: "Bankdatum", soort: "datum" },
+      { k: "afschrift", label: "Afschrift" },
+      { k: "tegenpartij", label: "Tegenpartij" },
+      { k: "tegenrekening", label: "Tegenrekening" },
+      { k: "omschrijving", label: "Omschrijving" },
+      { k: "bedrag", label: "Bedrag", soort: "bedrag" },
+      { k: "code", label: "Type/status" },
+      { k: "bron", label: "Bron" },
+    ],
+    sql: () => `SELECT 'bt' || t.pk AS sleutel, ${BT_DATUM} AS datum,
+             concat_ws('·', ${BT("statementnumber")}, ${BT("statementlinenumber")}) AS afschrift,
+             ${BT("offsetname")} AS tegenpartij, ${BT_IBAN} AS tegenrekening, ${BT("description")} AS omschrijving,
+             vda_num(t.data->>'amountdc') AS bedrag, concat_ws('/', ${BT("type")}, ${BT("status")}) AS code,
+             CASE WHEN ${BT("filename")} IS NOT NULL THEN 'ingelezen' ELSE 'zonder bestand' END AS bron
+        FROM globe_row t
+       WHERE t.admin_key = $1 AND t.tbl = 'banktransactions' AND ${BT_GEEN_TERMIJN}
+         AND ${BT("entrynumber")} IS NULL AND ${BT("matchid")} IS NULL
+         AND extract(year FROM ${BT_DATUM}) = $2 AND ${BT_DATUM} < current_date - 14
+       ORDER BY abs(vda_num(t.data->>'amountdc')) DESC NULLS LAST`,
+  },
+  {
+    id: "bank_dubbel",
+    titel: "Mogelijk dubbel geboekte bankmutaties",
+    uitleg:
+      "Regels op een bank- of kasrekening in een bankdagboek met dezelfde datum, hetzelfde bedrag en dezelfde omschrijving, in meer dan één regel. Een afschrift dat twee keer is ingevoerd of ingelezen geeft precies dit beeld.",
+    kanttekening: "Twee gelijke betalingen op één dag (bijvoorbeeld twee keer dezelfde huur of een vaste opdracht) kunnen kloppen. Vanaf € 50.",
+    kolommen: [
+      { k: "datum", label: "Datum", soort: "datum" },
+      { k: "dagboek", label: "Dagboek" },
+      { k: "omschrijving", label: "Omschrijving" },
+      { k: "bedrag", label: "Bedrag", soort: "bedrag" },
+      { k: "keer", label: "Aantal", soort: "getal" },
+      { k: "boekstukken", label: "Boekstukken" },
+    ],
+    sql: () => `WITH ${BANK_CTE}
+      SELECT m.dagboek, m.datum, m.omschrijving, m.bedrag, count(*) AS keer,
+             string_agg(DISTINCT m.boekstuk, ', ') AS boekstukken,
+             m.dagboek || '|' || m.datum || '|' || m.bedrag || '|' || COALESCE(m.omschrijving, '') AS sleutel
+        FROM gb_mutatie m JOIN bank ON bank.dagboek = m.dagboek AND bank.rekening = m.grootboek
+       WHERE m.admin_key = $1 AND m.boekjaar = $2 AND m.periode <> 0 AND abs(m.bedrag) >= 50
+       GROUP BY m.dagboek, m.datum, m.omschrijving, m.bedrag
+      HAVING count(*) > 1
+       ORDER BY abs(m.bedrag) DESC`,
+  },
+  {
+    id: "bank_direct_wv",
+    titel: "Bankmutaties direct op kosten of opbrengsten",
+    uitleg:
+      "In een bankdagboek geboekt op een winst-en-verliesrekening, zonder debiteur of crediteur: er is dan geen factuur in de administratie. Daar kan btw zijn gemist, een privé-uitgave tussen zitten of een ontvangst die omzet had moeten zijn. Vanaf € 500.",
+    kanttekening: "Bankkosten, rente, verzekeringen en belastingen worden vaak zo geboekt en zijn meestal in orde.",
+    kolommen: [
+      { k: "boekstuk", label: "Boekstuk", soort: "boekstuk" },
+      { k: "datum", label: "Datum", soort: "datum" },
+      { k: "grootboek", label: "Rekening", soort: "grootboek" },
+      { k: "rekening", label: "Omschrijving rekening" },
+      { k: "omschrijving", label: "Omschrijving" },
+      { k: "btw_code", label: "Btw" },
+      { k: "bedrag", label: "Bedrag", soort: "bedrag" },
+    ],
+    sql: () => `WITH ${BANK_CTE},
+      wv AS (SELECT trim(data->>'reknr') AS grootboek, data->>'oms25_0' AS oms FROM globe_row
+              WHERE admin_key = $1 AND tbl = 'grtbk' AND upper(trim(data->>'bal_vw')) = 'W')
+      SELECT m.pk AS sleutel, m.dagboek, m.boekstuk, m.datum, m.grootboek, wv.oms AS rekening, m.omschrijving, m.btw_code, m.bedrag
+        FROM gb_mutatie m JOIN bank ON bank.dagboek = m.dagboek JOIN wv ON wv.grootboek = m.grootboek
+       WHERE m.admin_key = $1 AND m.boekjaar = $2 AND m.periode <> 0
+         AND m.debiteur IS NULL AND m.crediteur IS NULL AND abs(m.bedrag) >= 500
+       ORDER BY abs(m.bedrag) DESC`,
+  },
+  {
+    id: "bank_laat",
+    titel: "Bankmutaties lang na de bankdatum geboekt",
+    uitleg:
+      "Boekstukken in een bankdagboek die meer dan 45 dagen na de bankdatum in Globe zijn ingevoerd. Zegt iets over achterstand, en over de kans dat tussentijdse cijfers (btw-aangifte, kwartaalcijfers) onvolledig waren.",
+    kanttekening: "Gebaseerd op het invoermoment dat Globe bij de regel vastlegt.",
+    kolommen: [
+      { k: "boekstuk", label: "Boekstuk", soort: "boekstuk" },
+      { k: "datum", label: "Bankdatum", soort: "datum" },
+      { k: "ingevoerd", label: "Ingevoerd", soort: "tijd" },
+      { k: "dagen", label: "Dagen later", soort: "getal" },
+      { k: "gebruiker", label: "Door" },
+      { k: "regels", label: "Regels", soort: "getal" },
+    ],
+    sql: () => `WITH ${BANK_CTE}
+      SELECT m.dagboek, m.boekstuk, max(m.datum) AS datum, min(m.geboekt_op) AS ingevoerd,
+             min(m.geboekt_op)::date - max(m.datum) AS dagen, string_agg(DISTINCT m.gebruiker, ', ') AS gebruiker, count(*) AS regels,
+             m.dagboek || '|' || m.boekstuk AS sleutel
+        FROM gb_mutatie m JOIN bank ON bank.dagboek = m.dagboek
+       WHERE m.admin_key = $1 AND m.boekjaar = $2 AND m.periode <> 0 AND m.geboekt_op IS NOT NULL
+       GROUP BY m.dagboek, m.boekstuk
+      HAVING min(m.geboekt_op)::date - max(m.datum) > 45
+       ORDER BY dagen DESC`,
+  },
+  {
+    id: "crediteur_iban",
+    titel: "Crediteur met meer dan één bankrekening",
+    uitleg:
+      "Leveranciers waaraan vanaf verschillende tegenrekeningen (IBAN's) is betaald of ontvangen. Een gewijzigd rekeningnummer is de klassieke route voor factuurfraude: betalingen gaan dan naar een rekening die niet van de leverancier is.",
+    kanttekening: "Een leverancier kan echt van bank wisselen of meerdere rekeningen hebben. Kijk vooral naar nieuwe IBAN's in dit jaar.",
+    kolommen: [
+      { k: "crediteur", label: "Crediteur" },
+      { k: "namen", label: "Naam" },
+      { k: "ibans", label: "Tegenrekeningen" },
+      { k: "regels", label: "Regels", soort: "getal" },
+      { k: "nieuwste", label: "Nieuwste IBAN sinds", soort: "datum" },
+    ],
+    sql: () => `WITH r AS (
+        SELECT ${BT("creditornumber")} AS crediteur, ${BT("offsetname")} AS naam, ${BT_IBAN} AS iban, ${BT_DATUM} AS datum
+          FROM globe_row t WHERE t.admin_key = $1 AND t.tbl = 'banktransactions'),
+      per AS (SELECT crediteur, iban, min(datum) AS eerst, max(datum) AS laatst, count(*) AS n FROM r
+               WHERE crediteur IS NOT NULL AND iban IS NOT NULL GROUP BY crediteur, iban)
+      SELECT p.crediteur, (SELECT string_agg(DISTINCT naam, ' / ') FROM r WHERE r.crediteur = p.crediteur) AS namen,
+             string_agg(p.iban, ', ' ORDER BY p.eerst) AS ibans, sum(p.n) AS regels, max(p.eerst) AS nieuwste,
+             p.crediteur || '|' || string_agg(p.iban, ',' ORDER BY p.iban) AS sleutel
+        FROM per p GROUP BY p.crediteur
+      HAVING count(*) > 1 AND max(p.laatst) >= make_date($2, 1, 1)
+       ORDER BY max(p.eerst) DESC`,
+  },
+  {
+    id: "iban_meerdere_relaties",
+    titel: "Eén bankrekening bij meerdere relaties",
+    uitleg:
+      "Tegenrekeningen (IBAN's) die bij verschillende debiteuren of crediteuren voorkomen. Kan een dubbel aangemaakte relatie zijn, maar ook betalingen aan een privérekening of een rekening die niet bij die relatie hoort.",
+    kanttekening: "Factoringmaatschappijen, incassobureaus en betaaldiensten (bijv. Mollie, Adyen) ontvangen vaak voor meerdere partijen.",
+    kolommen: [
+      { k: "iban", label: "Tegenrekening" },
+      { k: "relaties", label: "Relaties" },
+      { k: "namen", label: "Namen" },
+      { k: "regels", label: "Regels", soort: "getal" },
+      { k: "laatst", label: "Laatst", soort: "datum" },
+    ],
+    sql: () => `WITH r AS (
+        SELECT ${BT_IBAN} AS iban, COALESCE(${BT("creditornumber")}, ${BT("debtornumber")}) AS relatie,
+               ${BT("offsetname")} AS naam, ${BT_DATUM} AS datum
+          FROM globe_row t WHERE t.admin_key = $1 AND t.tbl = 'banktransactions')
+      SELECT iban, string_agg(DISTINCT relatie, ', ') AS relaties, string_agg(DISTINCT naam, ' / ') AS namen,
+             count(*) AS regels, max(datum) AS laatst, iban AS sleutel
+        FROM r WHERE iban IS NOT NULL AND relatie IS NOT NULL
+       GROUP BY iban
+      HAVING count(DISTINCT relatie) > 1 AND max(datum) >= make_date($2, 1, 1)
+       ORDER BY max(datum) DESC`,
   },
   {
     id: "negatieve_kas",

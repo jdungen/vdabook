@@ -16,30 +16,12 @@ import type pg from "pg";
 /** Rekeningnamen van bank, kas en spaar; zelfde herkenning als de tegel liquide middelen. */
 export const LIQUIDE = "(bank|\\mkas\\M|kasgeld|rabo|\\ming\\M|abn|knab|triodos|spaar|deposito|giro)";
 
-export interface BankDagboek {
-  dagboek: string;
-  naam: string | null;
-  soort: string; // bank | kas | herkend
-  rekening: string | null;
-  rekening_oms: string | null;
-  boekstukken: number;
-  eerste_datum: string | null;
-  laatste_datum: string | null;
-  laatste_invoer: string | null;
-  saldo: string | null;
-}
-
-export class Bank {
-  constructor(private readonly pool: pg.Pool) {}
-
-  /**
-   * Bank- en kasdagboeken met hun rekening en saldo eind boekjaar $2.
-   * Dagboek-informatie uit Globe (dagbk) gaat voor; kolomnamen worden
-   * defensief gelezen omdat ze per Globe-versie kunnen verschillen.
-   */
-  async dagboeken(admin: string, jaar: number): Promise<BankDagboek[]> {
-    const r = await this.pool.query<BankDagboek>(
-      `WITH rek AS (
+/**
+ * CTE's (zonder WITH) die de bank- en kasdagboeken van administratie $1 opleveren:
+ * rek(grootboek, oms), liq(grootboek), dg, per, bank(dagboek, naam, soort, rekening, n, ...).
+ * Gedeeld door de Bank-pagina en de auditcontroles.
+ */
+export const BANK_CTE = `rek AS (
          SELECT trim(data->>'reknr') AS grootboek, data->>'oms25_0' AS oms
            FROM globe_row WHERE admin_key = $1 AND tbl = 'grtbk'),
        liq AS (
@@ -68,7 +50,32 @@ export class Bank {
                 COALESCE(dg.rekening, per.vaak_liq) AS rekening
            FROM per LEFT JOIN dg ON dg.dagboek = per.dagboek
           WHERE dg.soort IN ('B', 'K')
-             OR ((dg.soort IS NULL OR dg.soort NOT IN ('V', 'I', 'M', 'G', 'D', 'C')) AND per.n_liq >= 0.8 * per.n AND per.n_liq > 0))
+             OR ((dg.soort IS NULL OR dg.soort NOT IN ('V', 'I', 'M', 'G', 'D', 'C')) AND per.n_liq >= 0.8 * per.n AND per.n_liq > 0))`;
+
+export interface BankDagboek {
+  dagboek: string;
+  naam: string | null;
+  soort: string; // bank | kas | herkend
+  rekening: string | null;
+  rekening_oms: string | null;
+  boekstukken: number;
+  eerste_datum: string | null;
+  laatste_datum: string | null;
+  laatste_invoer: string | null;
+  saldo: string | null;
+}
+
+export class Bank {
+  constructor(private readonly pool: pg.Pool) {}
+
+  /**
+   * Bank- en kasdagboeken met hun rekening en saldo eind boekjaar $2.
+   * Dagboek-informatie uit Globe (dagbk) gaat voor; kolomnamen worden
+   * defensief gelezen omdat ze per Globe-versie kunnen verschillen.
+   */
+  async dagboeken(admin: string, jaar: number): Promise<BankDagboek[]> {
+    const r = await this.pool.query<BankDagboek>(
+      `WITH ${BANK_CTE}
        SELECT b.dagboek, b.naam, b.soort, b.rekening, rek.oms AS rekening_oms,
               b.n::int AS boekstukken, b.eerste_datum, b.laatste_datum, b.laatste_invoer,
               (SELECT round(sum(s.bedrag), 2) FROM gb_mutatie s
