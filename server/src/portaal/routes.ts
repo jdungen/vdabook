@@ -12,7 +12,7 @@ import { Gebruikers, MIN_WACHTWOORD, type Admin, type Gebruiker, type Rol } from
 import { Rapport, LOON_TABEL, Aansluiting, type OnderlingPaar } from "./rapport.js";
 type OnderlingRegel = OnderlingPaar["a"][number];
 import { Audit, type Kolom } from "./audit.js";
-import { Bank } from "./bank.js";
+import { Bank, Bankregels, type BankregelFilter } from "./bank.js";
 import { adminNaam, bedragCel, datum, esc, euro, geleden, getal, kader, losKader, meldingen, qs, tijdstip } from "./ui.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -54,7 +54,12 @@ function gelijk(a: string, b: string): boolean {
 function csv(kolommen: Array<{ k: string; label: string }>, rijen: Array<Record<string, unknown>>): string {
   const cel = (v: unknown) => {
     if (v === null || v === undefined) return "";
-    if (v instanceof Date) return v.toISOString().slice(0, 19).replace("T", " ");
+    if (v instanceof Date) {
+      // Lokale tijd: pg levert date/timestamp als lokale tijd, toISOString zou er UTC van maken.
+      const t = (n: number) => String(n).padStart(2, "0");
+      const d = `${v.getFullYear()}-${t(v.getMonth() + 1)}-${t(v.getDate())}`;
+      return v.getHours() || v.getMinutes() || v.getSeconds() ? `${d} ${t(v.getHours())}:${t(v.getMinutes())}:${t(v.getSeconds())}` : d;
+    }
     if (typeof v === "number" || (typeof v === "string" && /^-?\d+(\.\d+)?$/.test(v) && v.length < 16)) return String(v).replace(".", ",");
     if (typeof v === "object") return `"${JSON.stringify(v).replace(/"/g, '""')}"`;
     const s = String(v);
@@ -69,6 +74,7 @@ export function portaal(o: PortaalOpties): express.Router {
   const rapport = new Rapport(o.pool);
   const audit = new Audit(o.pool);
   const bank = new Bank(o.pool);
+  const bankregels = new Bankregels(o.pool);
   const aansluiting = new Aansluiting(o.pool);
   const pogingen = new Pogingen();
   setInterval(() => pogingen.opruimen(), 30 * 60_000).unref();
@@ -785,6 +791,8 @@ ${rel.length ? `<div class="kaart schuif"><table class="lijst"><tr><th>Naam</th>
 
     const maanden = gekozen ? await bank.perMaand(a.admin_key, gekozen.dagboek, jaar) : [];
     const ritme = lijst.length ? await bank.invoerdagen(a.admin_key, lijst.map((x) => x.dagboek), 60) : [];
+    const samen = await bankregels.samenstelling(a.admin_key);
+    const btMaand = samen.length ? await bankregels.perMaand(a.admin_key, 24) : [];
     await log(req, "bekijk_bank", a.admin_key, { dagboek: gekozen?.dagboek, ...f });
 
     const nu = new Date();
@@ -867,7 +875,80 @@ ${ritmeRijen ? `<div class="kaart schuif"><table class="lijst"><tr><th>Ingevoerd
 </form>
 <p class="sub">${getal(st.aantal)} afschriften · netto mutatie ${euro(st.mutatie)}</p>
 ${stRijen ? `<div class="kaart schuif"><table class="lijst"><tr><th>Bankdatum</th><th>Boekstuk</th><th>Omschrijving</th><th class="r">Regels</th><th class="r">Ontvangen</th><th class="r">Betaald</th><th class="r">Mutatie</th><th>Ingevoerd door</th><th>Ingevoerd op</th><th class="r">Dagen later</th><th></th></tr>${stRijen}</table></div>` : `<div class="leeg">Geen afschriften met deze filters.</div>`}
-<div class="paginering"><span>${st.aantal > PAGINA ? `Afschriften ${pagina * PAGINA + 1}–${Math.min((pagina + 1) * PAGINA, st.aantal)} van ${getal(st.aantal)}` : ""}</span><span class="knoppen">${pagina > 0 ? `<a class="knop" href="${qs({ ...fq, p: pagina - 1 })}">Vorige</a>` : ""}${(pagina + 1) * PAGINA < st.aantal ? `<a class="knop" href="${qs({ ...fq, p: pagina + 1 })}">Volgende</a>` : ""}</span></div>`}`,
+<div class="paginering"><span>${st.aantal > PAGINA ? `Afschriften ${pagina * PAGINA + 1}–${Math.min((pagina + 1) * PAGINA, st.aantal)} van ${getal(st.aantal)}` : ""}</span><span class="knoppen">${pagina > 0 ? `<a class="knop" href="${qs({ ...fq, p: pagina - 1 })}">Vorige</a>` : ""}${(pagina + 1) * PAGINA < st.aantal ? `<a class="knop" href="${qs({ ...fq, p: pagina + 1 })}">Volgende</a>` : ""}</span></div>`}
+${samen.length ? `<h2>Bankregels in Globe (tabel banktransactions)</h2>
+<p class="uitleg">Naast de boekingen houdt Globe bankregels bij: ingelezen afschriftregels, betaalopdrachten en termijnen (type <span class="mono">W</span>, openstaande posten). Een regel met een importbestand komt uit een ingelezen bankbestand; zonder bestand is hij in Globe zelf aangemaakt. "Geboekt" betekent: er hangt een boekstuk of koppeling aan. De codes voor type en status zijn die van Globe.</p>
+<h2>Per maand (bankdatum), zonder termijnen · laatste 24 maanden</h2>
+${btMaand.length ? `<div class="kaart schuif"><table class="lijst"><tr><th>Maand</th><th class="r">Regels</th><th class="r">Uit importbestand</th><th class="r">Bestanden</th><th class="r">Geboekt</th><th class="r">Niet geboekt</th><th>Aangemaakt door</th><th class="r">Gem. dagen later</th></tr>${btMaand
+          .map((m: any) => {
+            const d = new Date(m.maand);
+            const van = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-01`;
+            const tot = new Date(d.getFullYear(), d.getMonth() + 1, 0);
+            const totS = `${tot.getFullYear()}-${String(tot.getMonth() + 1).padStart(2, "0")}-${String(tot.getDate()).padStart(2, "0")}`;
+            const pct = Number(m.regels) ? Math.round((Number(m.met_bestand) / Number(m.regels)) * 100) : 0;
+            const basis = `/a/${encodeURIComponent(db)}/bank/regels`;
+            return `<tr><td><a href="${basis}${qs({ van, tot: totS })}">${MAANDEN[d.getMonth()]} ${d.getFullYear()}</a></td><td class="r num">${getal(m.regels)}</td><td class="r num">${getal(m.met_bestand)} <span class="badge ${pct >= 90 ? "ok" : pct >= 50 ? "let" : "mis"}">${pct}%</span></td><td class="r num">${getal(m.bestanden)}</td><td class="r num">${getal(m.geboekt)}</td><td class="r num">${Number(m.niet_geboekt) ? `<a href="${basis}${qs({ van, tot: totS, geboekt: "nee" })}">${getal(m.niet_geboekt)}</a>` : "0"}</td><td class="mono">${esc(m.aangemaakt_door ?? "")}</td><td class="r">${achterBadge(m.gem_dagen_later)}</td></tr>`;
+          })
+          .join("")}</table></div>` : `<div class="leeg">Geen bankregels (anders dan termijnen) in de afgelopen 24 maanden.</div>`}
+<h2>Samenstelling</h2>
+<div class="kaart schuif"><table class="lijst"><tr><th>Type</th><th>Status</th><th>Afschrifttype</th><th>Importbestand</th><th class="r">Regels</th><th>Bankdata</th><th>Laatst aangemaakt</th><th>Laatst gewijzigd</th></tr>${samen
+          .map((x: any) => `<tr><td class="mono"><a href="/a/${encodeURIComponent(db)}/bank/regels${qs({ type: x.type ?? "", status: x.status ?? "", bron: x.bestand ? "bestand" : "zonder" })}">${esc(x.type ?? "—")}</a></td><td class="mono">${esc(x.status ?? "—")}</td><td class="mono">${esc(x.afschrifttype ?? "—")}</td><td>${x.bestand ? `<span class="badge ok">ja</span>` : `<span class="badge">nee</span>`}</td><td class="r num">${getal(x.regels)}</td><td>${datum(x.eerste)} – ${datum(x.laatste)}</td><td>${x.laatst_aangemaakt ? tijdstip(x.laatst_aangemaakt) : ""}</td><td>${x.laatst_gewijzigd ? tijdstip(x.laatst_gewijzigd) : ""}</td></tr>`)
+          .join("")}</table></div>
+<p><a class="knop" href="/a/${encodeURIComponent(db)}/bank/regels">Alle bankregels doorzoeken</a></p>` : ""}`,
+      ),
+    );
+  });
+
+  r.get("/a/:db/bank/regels", async (req, res) => {
+    const ctx = await adminUit(req, res);
+    if (!ctx) return;
+    const { a, admins } = ctx;
+    const db = a.slug;
+    const datumQ = (v: unknown) => (str(v)?.match(/^\d{4}-\d{2}-\d{2}$/) ? str(v) : undefined);
+    const f: BankregelFilter = {
+      type: str(req.query.type),
+      status: str(req.query.status),
+      bron: req.query.bron === "bestand" || req.query.bron === "zonder" ? req.query.bron : undefined,
+      geboekt: req.query.geboekt === "ja" || req.query.geboekt === "nee" ? req.query.geboekt : undefined,
+      van: datumQ(req.query.van),
+      tot: datumQ(req.query.tot),
+      zoek: str(req.query.zoek),
+    };
+    const csvExport = req.query.formaat === "csv";
+    const pagina = Math.max(int(req.query.p) ?? 0, 0);
+    const b = await bankregels.regels(a.admin_key, f, csvExport ? 100_000 : PAGINA, csvExport ? 0 : pagina * PAGINA);
+    if (csvExport) {
+      await log(req, "export_bankregels", a.admin_key, f);
+      const kol = ["datum", "type", "status", "afschrifttype", "afschrift", "afschriftregel", "eigen_rekening", "tegenpartij", "tegenrekening", "omschrijving", "bedrag", "bestand", "boekstuk", "matchid", "grootboek", "tegengrootboek", "debiteur", "crediteur", "factuur", "aangemaakt", "aangemaakt_door", "gewijzigd", "gewijzigd_door", "versies"].map((k) => ({ k, label: k }));
+      const dag = (d: unknown) => (d instanceof Date ? `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}` : d);
+      return res.type("text/csv; charset=utf-8").attachment(`bankregels-${db}.csv`).send(csv(kol, (b.rijen as any[]).map((x) => ({ ...x, datum: dag(x.datum) }))));
+    }
+    await log(req, "bekijk_bankregels", a.admin_key, f);
+    const sel = (naam: string, waarde: string | undefined, opties: Array<[string, string]>) =>
+      `<select name="${naam}"><option value="">alle</option>${opties.map(([v, l]) => `<option value="${v}"${v === waarde ? " selected" : ""}>${esc(l)}</option>`).join("")}</select>`;
+    const rijen = (b.rijen as any[])
+      .map(
+        (x) =>
+          `<tr><td>${datum(x.datum)}</td><td class="mono">${esc(x.type ?? "")}/${esc(x.status ?? "")}</td><td class="mono">${esc(x.afschrift ?? "")}${x.afschriftregel ? `·${esc(x.afschriftregel)}` : ""}</td><td>${esc(x.tegenpartij ?? "")}<br><span class="gedempt mono">${esc(x.tegenrekening ?? "")}</span></td><td>${esc(x.omschrijving ?? "")}</td>${bedragCel(x.bedrag)}<td>${x.bestand ? `<span class="badge ok" title="${esc(x.bestand)}">ingelezen</span>` : `<span class="badge">zonder bestand</span>`}</td><td>${x.boekstuk ? `<a class="mono" href="/a/${encodeURIComponent(db)}/mutaties${qs({ zoek: x.boekstuk })}">${esc(x.boekstuk)}</a>` : x.matchid ? `<span class="gedempt mono">match ${esc(x.matchid)}</span>` : `<span class="badge let">niet geboekt</span>`}</td><td>${x.aangemaakt ? tijdstip(x.aangemaakt) : ""} <span class="gedempt mono">${esc(x.aangemaakt_door ?? "")}</span>${Number(x.versies) > 1 ? ` <span class="badge let">${getal(x.versies)} versies</span>` : ""}</td></tr>`,
+      )
+      .join("");
+    res.type("html").send(
+      kader(
+        { titel: "Bankregels", g: req.g!, admins, admin: a, actief: "bank", subpad: "/bank/regels" },
+        `<header class="top"><div><h1>Bankregels</h1><p class="sub">${esc(adminNaam(a))} · tabel banktransactions · ${getal(b.aantal)} regels · saldo ${euro(b.som)}</p></div><div class="knoppen"><a class="knop" href="/a/${encodeURIComponent(db)}/bank">Terug naar Bank</a></div></header>
+<form class="filter" method="get">
+  <label>Zoek<input name="zoek" value="${esc(f.zoek ?? "")}" placeholder="naam, omschrijving, IBAN, boekstuk"></label>
+  <label>Type<input name="type" value="${esc(f.type ?? "")}" size="3" placeholder="niet W"></label>
+  <label>Status<input name="status" value="${esc(f.status ?? "")}" size="3"></label>
+  <label>Bron${sel("bron", f.bron, [["bestand", "uit importbestand"], ["zonder", "zonder bestand"]])}</label>
+  <label>Geboekt${sel("geboekt", f.geboekt, [["ja", "ja"], ["nee", "nee"]])}</label>
+  <label>Van<input type="date" name="van" value="${esc(f.van ?? "")}"></label>
+  <label>Tot<input type="date" name="tot" value="${esc(f.tot ?? "")}"></label>
+  <button class="primair">Zoek</button><a class="knop" href="${qs({ ...f, formaat: "csv" })}">CSV</a>
+</form>
+<p class="uitleg">${f.type ? "" : "Termijnen (type W, openstaande posten) staan hier niet tussen; vul type W in om ze te zien. "}"Ingelezen" = er hangt een importbestand aan de regel. Klik op het boekstuk voor de boeking.</p>
+${rijen ? `<div class="kaart schuif"><table class="lijst"><tr><th>Datum</th><th>Type/status</th><th>Afschrift</th><th>Tegenpartij</th><th>Omschrijving</th><th class="r">Bedrag</th><th>Bron</th><th>Boekstuk</th><th>Aangemaakt</th></tr>${rijen}</table></div>` : `<div class="leeg">Geen bankregels met deze filters.</div>`}
+<div class="paginering"><span>${b.aantal > PAGINA ? `Regels ${pagina * PAGINA + 1}–${Math.min((pagina + 1) * PAGINA, b.aantal)} van ${getal(b.aantal)}` : ""}</span><span class="knoppen">${pagina > 0 ? `<a class="knop" href="${qs({ ...f, p: pagina - 1 })}">Vorige</a>` : ""}${(pagina + 1) * PAGINA < b.aantal ? `<a class="knop" href="${qs({ ...f, p: pagina + 1 })}">Volgende</a>` : ""}</span></div>`,
       ),
     );
   });

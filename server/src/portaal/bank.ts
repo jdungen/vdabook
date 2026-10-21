@@ -174,3 +174,88 @@ export class Bank {
     return r.rows as Array<{ maand: number; boekstukken: string; regels: string; gem_dagen_later: string | null; max_dagen_later: number | null; laatste_invoer: string | null }>;
   }
 }
+
+/** Veld uit een banktransactions-rij (alias t). Globe-kolommen staan in kleine letters in de spiegel. */
+const bt = (k: string) => `nullif(trim(t.data->>'${k}'), '')`;
+/** Datum van een bankregel: valutadatum, anders afschriftdatum, anders verwerkingsdatum. */
+const BT_DATUM = `COALESCE(vda_datum(t.data->>'valuedate'), vda_datum(t.data->>'statementdate'), vda_datum(t.data->>'processingdate'))`;
+/** Ingelezen = er hangt een importbestand aan de regel. */
+const BT_BESTAND = `(${bt("filename")} IS NOT NULL)`;
+/** Geboekt = er is een boekstuknummer of een koppeling met een boeking. */
+const BT_GEBOEKT = `(${bt("entrynumber")} IS NOT NULL OR ${bt("matchid")} IS NOT NULL)`;
+
+export interface BankregelFilter {
+  type?: string;
+  status?: string;
+  bron?: "bestand" | "zonder";
+  geboekt?: "ja" | "nee";
+  van?: string;
+  tot?: string;
+  zoek?: string;
+}
+
+export class Bankregels {
+  constructor(private readonly pool: pg.Pool) {}
+
+  /** Samenstelling van de tabel: per type, status, afschrifttype en wel/geen importbestand. */
+  async samenstelling(admin: string) {
+    const r = await this.pool.query(
+      `SELECT ${bt("type")} AS type, ${bt("status")} AS status, ${bt("statementtype")} AS afschrifttype, ${BT_BESTAND} AS bestand,
+              count(*) AS regels, min(${BT_DATUM}) AS eerste, max(${BT_DATUM}) AS laatste,
+              max(vda_tijd(t.data->>'syscreated')) AS laatst_aangemaakt, max(vda_tijd(t.data->>'sysmodified')) AS laatst_gewijzigd
+         FROM globe_row t WHERE t.admin_key = $1 AND t.tbl = 'banktransactions'
+        GROUP BY 1, 2, 3, 4 ORDER BY count(*) DESC LIMIT 60`,
+      [admin],
+    );
+    return r.rows;
+  }
+
+  /** Per maand (bankdatum), alle regels behalve termijnen (type W): ingelezen, geboekt, wie en hoe snel. */
+  async perMaand(admin: string, maanden: number) {
+    const r = await this.pool.query(
+      `SELECT date_trunc('month', ${BT_DATUM})::date AS maand,
+              count(*) AS regels,
+              count(*) FILTER (WHERE ${BT_BESTAND}) AS met_bestand,
+              count(*) FILTER (WHERE ${BT_GEBOEKT}) AS geboekt,
+              count(*) FILTER (WHERE NOT ${BT_GEBOEKT}) AS niet_geboekt,
+              count(DISTINCT ${bt("filename")}) AS bestanden,
+              string_agg(DISTINCT ${bt("syscreator")}, ', ') AS aangemaakt_door,
+              round(avg(vda_tijd(t.data->>'syscreated')::date - ${BT_DATUM})) AS gem_dagen_later
+         FROM globe_row t
+        WHERE t.admin_key = $1 AND t.tbl = 'banktransactions' AND COALESCE(${bt("type")}, '') <> 'W'
+          AND ${BT_DATUM} >= (date_trunc('month', now()) - make_interval(months => $2))::date
+        GROUP BY 1 ORDER BY 1 DESC`,
+      [admin, maanden],
+    );
+    return r.rows;
+  }
+
+  /** Losse bankregels met filters, nieuwste eerst. */
+  async regels(admin: string, f: BankregelFilter, limiet: number, offset: number) {
+    const r = await this.pool.query(
+      `SELECT t.pk, ${BT_DATUM} AS datum, ${bt("type")} AS type, ${bt("status")} AS status, ${bt("statementtype")} AS afschrifttype,
+              ${bt("statementnumber")} AS afschrift, ${bt("statementlinenumber")} AS afschriftregel, ${bt("ownbankaccount")} AS eigen_rekening,
+              ${bt("offsetname")} AS tegenpartij, ${bt("offsetbankaccount")} AS tegenrekening, ${bt("description")} AS omschrijving,
+              vda_num(t.data->>'amountdc') AS bedrag, ${bt("filename")} AS bestand, ${bt("entrynumber")} AS boekstuk, ${bt("matchid")} AS matchid,
+              ${bt("ledgeraccount")} AS grootboek, ${bt("offsetledgeraccountnumber")} AS tegengrootboek,
+              ${bt("debtornumber")} AS debiteur, ${bt("creditornumber")} AS crediteur, ${bt("invoicenumber")} AS factuur,
+              vda_tijd(t.data->>'syscreated') AS aangemaakt, ${bt("syscreator")} AS aangemaakt_door,
+              vda_tijd(t.data->>'sysmodified') AS gewijzigd, ${bt("sysmodifier")} AS gewijzigd_door, t.versies,
+              count(*) OVER () AS totaal_aantal, sum(vda_num(t.data->>'amountdc')) OVER () AS totaal_bedrag
+         FROM globe_row t
+        WHERE t.admin_key = $1 AND t.tbl = 'banktransactions'
+          AND (CASE WHEN $2::text IS NULL THEN COALESCE(${bt("type")}, '') <> 'W' ELSE ${bt("type")} = $2 END)
+          AND ($3::text IS NULL OR ${bt("status")} = $3)
+          AND ($4::text IS NULL OR ($4 = 'bestand') = ${BT_BESTAND})
+          AND ($5::text IS NULL OR ($5 = 'ja') = ${BT_GEBOEKT})
+          AND ($6::date IS NULL OR ${BT_DATUM} >= $6)
+          AND ($7::date IS NULL OR ${BT_DATUM} <= $7)
+          AND ($8::text IS NULL OR t.data->>'offsetname' ILIKE '%' || $8 || '%' OR t.data->>'description' ILIKE '%' || $8 || '%'
+               OR t.data->>'offsetbankaccount' ILIKE '%' || $8 || '%' OR trim(t.data->>'entrynumber') = $8 OR trim(t.data->>'statementnumber') = $8)
+        ORDER BY ${BT_DATUM} DESC NULLS LAST, t.pk DESC
+        LIMIT $9 OFFSET $10`,
+      [admin, f.type ?? null, f.status ?? null, f.bron ?? null, f.geboekt ?? null, f.van ?? null, f.tot ?? null, f.zoek ?? null, limiet, offset],
+    );
+    return { rijen: r.rows, aantal: Number(r.rows[0]?.totaal_aantal ?? 0), som: Number(r.rows[0]?.totaal_bedrag ?? 0) };
+  }
+}
