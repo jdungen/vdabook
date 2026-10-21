@@ -50,6 +50,7 @@ const ICOON: Record<string, string> = {
   balans: '<path d="M12 3v18M5 7h14M7 7l-3 7a3 3 0 0 0 6 0zM17 7l-3 7a3 3 0 0 0 6 0z"/>',
   resultaat: '<path d="M4 19V5M4 19h16M8 15l3-4 3 2 5-6"/>',
   mutaties: '<path d="M4 6h16M4 12h16M4 18h10"/>',
+  bank: '<path d="M3 10l9-6 9 6M5 10v8M9 10v8M15 10v8M19 10v8M3 20h18"/>',
   relaties: '<circle cx="9" cy="8" r="3"/><path d="M3 20a6 6 0 0 1 12 0M16 11a3 3 0 1 0 0-6M21 20a6 6 0 0 0-4-5.6"/>',
   audit: '<path d="M9 12l2 2 4-4"/><path d="M12 3l8 3v6c0 4.5-3.4 8-8 9-4.6-1-8-4.5-8-9V6z"/>',
   tabellen: '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 10h18M9 10v10"/>',
@@ -61,13 +62,14 @@ const ICOON: Record<string, string> = {
 export const svg = (naam: string) =>
   `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICOON[naam] ?? ""}</svg>`;
 
-export type Pagina = "overzicht" | "balans" | "resultaat" | "mutaties" | "relaties" | "audit" | "tabellen" | "wijzigingen" | "beheer";
+export type Pagina = "overzicht" | "balans" | "resultaat" | "mutaties" | "bank" | "relaties" | "audit" | "tabellen" | "wijzigingen" | "beheer";
 
 const MENU: Array<{ pagina: Pagina; pad: string; lang: string; kort: string }> = [
   { pagina: "overzicht", pad: "", lang: "Overzicht", kort: "Overzicht" },
   { pagina: "balans", pad: "/balans", lang: "Balans", kort: "Balans" },
   { pagina: "resultaat", pad: "/resultaat", lang: "Resultaat", kort: "W&V" },
   { pagina: "mutaties", pad: "/mutaties", lang: "Mutaties", kort: "Mutaties" },
+  { pagina: "bank", pad: "/bank", lang: "Bank", kort: "Bank" },
   { pagina: "audit", pad: "/audit", lang: "Audit", kort: "Audit" },
   { pagina: "tabellen", pad: "/tabellen", lang: "Alle gegevens", kort: "Alles" },
 ];

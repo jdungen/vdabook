@@ -12,6 +12,7 @@ import { Gebruikers, MIN_WACHTWOORD, type Admin, type Gebruiker, type Rol } from
 import { Rapport, LOON_TABEL, Aansluiting, type OnderlingPaar } from "./rapport.js";
 type OnderlingRegel = OnderlingPaar["a"][number];
 import { Audit, type Kolom } from "./audit.js";
+import { Bank } from "./bank.js";
 import { adminNaam, bedragCel, datum, esc, euro, geleden, getal, kader, losKader, meldingen, qs, tijdstip } from "./ui.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -67,6 +68,7 @@ export function portaal(o: PortaalOpties): express.Router {
   const g = o.gebruikers;
   const rapport = new Rapport(o.pool);
   const audit = new Audit(o.pool);
+  const bank = new Bank(o.pool);
   const aansluiting = new Aansluiting(o.pool);
   const pogingen = new Pogingen();
   setInterval(() => pogingen.opruimen(), 30 * 60_000).unref();
@@ -732,6 +734,140 @@ ${w.rijen.length ? historieTabel(w.rijen) : `<div class="leeg">Niets gewijzigd o
 ${rel.length ? `<div class="kaart schuif"><table class="lijst"><tr><th>Naam</th><th>Code</th><th>Debiteur</th><th>Crediteur</th><th>Plaats</th><th class="r">Saldo alle jaren</th></tr>${rel
           .map((x: any) => `<tr><td>${esc(x.naam)}</td><td class="mono">${esc(x.code ?? "")}</td><td class="mono">${x.debiteur ? `<a href="/a/${encodeURIComponent(db)}/mutaties${qs({ relatie: x.debiteur })}">${esc(x.debiteur)}</a>` : ""}</td><td class="mono">${x.crediteur ? `<a href="/a/${encodeURIComponent(db)}/mutaties${qs({ relatie: x.crediteur })}">${esc(x.crediteur)}</a>` : ""}</td><td>${esc(x.plaats ?? "")}</td>${bedragCel(x.omzet_som)}</tr>`)
           .join("")}</table></div>` : `<div class="leeg">Geen relaties gevonden.</div>`}`,
+      ),
+    );
+  });
+
+  /* ----------------------------------------------------------------- bank */
+
+  const MAANDEN = ["jan", "feb", "mrt", "apr", "mei", "jun", "jul", "aug", "sep", "okt", "nov", "dec"];
+  const achterBadge = (d: unknown) => {
+    if (d === null || d === undefined || d === "") return `<span class="gedempt">?</span>`;
+    const n = Number(d);
+    const k = n <= 7 ? "ok" : n <= 31 ? "let" : "mis";
+    return `<span class="badge ${k}">${getal(n)} d</span>`;
+  };
+
+  r.get("/a/:db/bank", async (req, res) => {
+    const ctx = await adminUit(req, res);
+    if (!ctx) return;
+    const { a, admins } = ctx;
+    const db = a.slug;
+    const { jaar, jaren } = await jaarUit(req, a.admin_key);
+    const lijst = await bank.dagboeken(a.admin_key, jaar);
+    const gekozen = lijst.find((x) => x.dagboek === str(req.query.dagboek)) ?? lijst.find((x) => x.soort === "bank") ?? lijst[0];
+    const achterQ = str(req.query.achter) ? int(req.query.achter) : undefined;
+    const f = {
+      jaar: req.query.jaar === "alle" ? undefined : jaar,
+      van: str(req.query.van)?.match(/^\d{4}-\d{2}-\d{2}$/) ? str(req.query.van) : undefined,
+      tot: str(req.query.tot)?.match(/^\d{4}-\d{2}-\d{2}$/) ? str(req.query.tot) : undefined,
+      gebruiker: str(req.query.gebruiker),
+      achter: achterQ !== undefined && achterQ >= 0 ? achterQ : undefined,
+    };
+    const csvExport = req.query.formaat === "csv";
+    const pagina = Math.max(int(req.query.p) ?? 0, 0);
+    const st = gekozen
+      ? await bank.afschriften(a.admin_key, gekozen.dagboek, gekozen.rekening, f, csvExport ? 100_000 : PAGINA, csvExport ? 0 : pagina * PAGINA)
+      : { rijen: [], aantal: 0, mutatie: 0 };
+
+    if (csvExport && gekozen) {
+      await log(req, "export_bank", a.admin_key, { dagboek: gekozen.dagboek, ...f });
+      const kol = [
+        ["boekjaar", "Boekjaar"], ["periode", "Periode"], ["dagboek", "Dagboek"], ["boekstuk", "Boekstuk"],
+        ["datum_van", "Bankdatum van"], ["datum_tot", "Bankdatum tot"], ["ontvangen", "Ontvangen"], ["betaald", "Betaald"],
+        ["mutatie", "Mutatie"], ["regels", "Regels"], ["gebruikers", "Ingevoerd door"], ["ingevoerd_van", "Ingevoerd op"],
+        ["ingevoerd_tot", "Laatst ingevoerd"], ["dagen_later", "Dagen na bankdatum"], ["gewijzigd", "Regels gewijzigd"], ["verwijderd", "Regels verwijderd"],
+      ].map(([k, label]) => ({ k: k!, label: label! }));
+      const dag = (d: unknown) => (d instanceof Date ? `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}` : d);
+      const data = (st.rijen as any[]).map((x) => ({ ...x, datum_van: dag(x.datum_van), datum_tot: dag(x.datum_tot) }));
+      return res.type("text/csv; charset=utf-8").attachment(`bank-${db}-${gekozen.dagboek}.csv`).send(csv(kol, data));
+    }
+
+    const maanden = gekozen ? await bank.perMaand(a.admin_key, gekozen.dagboek, jaar) : [];
+    const ritme = lijst.length ? await bank.invoerdagen(a.admin_key, lijst.map((x) => x.dagboek), 60) : [];
+    await log(req, "bekijk_bank", a.admin_key, { dagboek: gekozen?.dagboek, ...f });
+
+    const nu = new Date();
+    const vandaag = new Date(nu.getFullYear(), nu.getMonth(), nu.getDate()).getTime();
+    const dagenGeleden = (d: unknown) => {
+      if (!d) return null;
+      const x = d instanceof Date ? d : new Date(String(d));
+      return Number.isNaN(x.getTime()) ? null : Math.round((vandaag - new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime()) / 86400_000);
+    };
+
+    const tegels = lijst
+      .map((x) => {
+        const geleden2 = dagenGeleden(x.laatste_datum);
+        const keuze = qs({ dagboek: x.dagboek, jaar });
+        return `<a class="tegel" href="${keuze}"${x.dagboek === gekozen?.dagboek ? ' style="border-color:var(--accent)"' : ""}>
+  <div class="label">${esc(x.soort === "kas" ? "Kas" : "Bank")} · dagboek ${esc(x.dagboek)}</div>
+  <div class="waarde">${x.saldo === null ? "—" : euro(x.saldo)}</div>
+  <div class="noot">${esc(x.naam ?? x.rekening_oms ?? "")}${x.rekening ? ` · rek. <span class="mono">${esc(x.rekening)}</span>` : ""}<br>
+  Saldo eind ${jaar} · laatste bankdatum ${datum(x.laatste_datum)}${geleden2 !== null ? ` (${getal(geleden2)} dagen geleden)` : ""}<br>
+  Laatst ingevoerd ${x.laatste_invoer ? tijdstip(x.laatste_invoer) : "onbekend"}</div></a>`;
+      })
+      .join("");
+
+    // Maanden zonder boeking zijn gaten: tot en met vorige maand in het lopende jaar, anders het hele jaar.
+    const laatsteMaand = jaar < nu.getFullYear() ? 12 : jaar === nu.getFullYear() ? nu.getMonth() + 1 : 0;
+    const perM = new Map(maanden.map((m) => [m.maand, m]));
+    const maandRijen = Array.from({ length: Math.max(laatsteMaand, ...maanden.map((m) => m.maand), 0) }, (_, i) => i + 1)
+      .map((mnd) => {
+        const m = perM.get(mnd);
+        const vanaf = `${jaar}-${String(mnd).padStart(2, "0")}-01`;
+        const eind = new Date(Date.UTC(jaar, mnd, 0)).toISOString().slice(0, 10);
+        if (!m) {
+          const lopend = jaar === nu.getFullYear() && mnd === nu.getMonth() + 1;
+          return `<tr><td>${MAANDEN[mnd - 1]} ${jaar}</td><td colspan="5">${lopend ? `<span class="badge let">nog niets geboekt</span>` : `<span class="badge mis">geen boekingen</span>`}</td></tr>`;
+        }
+        return `<tr><td><a href="${qs({ dagboek: gekozen!.dagboek, jaar, van: vanaf, tot: eind })}">${MAANDEN[mnd - 1]} ${jaar}</a></td><td class="r num">${getal(m.boekstukken)}</td><td class="r num">${getal(m.regels)}</td><td class="r">${achterBadge(m.gem_dagen_later)}</td><td class="r">${achterBadge(m.max_dagen_later)}</td><td>${m.laatste_invoer ? tijdstip(m.laatste_invoer) : ""}</td></tr>`;
+      })
+      .join("");
+
+    const ritmeRijen = ritme
+      .map(
+        (x: any) =>
+          `<tr><td>${datum(x.dag)}</td><td class="mono">${esc(x.gebruiker ?? "")}</td><td class="mono">${esc(x.dagboek)}</td><td class="r num">${getal(x.boekstukken)}</td><td class="r num">${getal(x.regels)}</td><td>${datum(x.bank_van)}${x.bank_van !== x.bank_tot ? ` – ${datum(x.bank_tot)}` : ""}</td><td class="r">${achterBadge(x.gem_dagen_later)}</td><td class="r">${achterBadge(x.max_dagen_later)}</td></tr>`,
+      )
+      .join("");
+
+    const stRijen = (st.rijen as any[])
+      .map(
+        (x) =>
+          `<tr><td>${datum(x.datum_tot)}${x.datum_van && String(x.datum_van) !== String(x.datum_tot) ? `<br><span class="gedempt">vanaf ${datum(x.datum_van)}</span>` : ""}</td><td>${boekstukLink(db, x.dagboek, x.boekstuk)}</td><td>${esc(x.voorbeeld ?? "")}</td><td class="r num">${getal(x.regels)}</td>${bedragCel(x.ontvangen)}${bedragCel(x.betaald)}${bedragCel(x.mutatie)}<td class="mono">${esc(x.gebruikers ?? "")}</td><td>${x.ingevoerd_van ? tijdstip(x.ingevoerd_van) : `<span class="gedempt">onbekend</span>`}</td><td class="r">${achterBadge(x.dagen_later)}</td><td>${Number(x.gewijzigd) > 0 ? `<span class="badge let">${getal(x.gewijzigd)} gewijzigd</span> ` : ""}${Number(x.verwijderd) > 0 ? `<span class="badge mis">${getal(x.verwijderd)} verwijderd</span>` : ""}</td></tr>`,
+      )
+      .join("");
+
+    const fq = { dagboek: gekozen?.dagboek, jaar: f.jaar ?? "alle", van: f.van, tot: f.tot, gebruiker: f.gebruiker, achter: f.achter };
+    res.type("html").send(
+      kader(
+        { titel: "Bank", g: req.g!, admins, admin: a, actief: "bank", subpad: "/bank" },
+        `<header class="top"><div><h1>Bank</h1><p class="sub">${esc(adminNaam(a))} · wat er in de bank- en kasdagboeken is ingevoerd, door wie en hoe lang na de bankdatum</p></div>
+<form class="filter" method="get">${gekozen ? `<input type="hidden" name="dagboek" value="${esc(gekozen.dagboek)}">` : ""}${jaarKiezer(jaren, jaar)}<button>Toon</button></form></header>
+${lijst.length === 0 ? `<div class="leeg">Geen bank- of kasdagboek herkend in deze administratie.</div>` : `
+<div class="tegels">${tegels}</div>
+<p class="uitleg">"Dagen na bankdatum" is het verschil tussen de datum op het afschrift en het moment waarop de regel in Globe is ingevoerd. Tot een week is groen, tot een maand oranje, daarboven rood. Een dagboek dat niet als bank- of kasdagboek in Globe staat, is herkend aan de boekingen.</p>
+
+<h2>Achterstand per maand · dagboek ${esc(gekozen!.dagboek)} · ${jaar}</h2>
+<div class="kaart schuif"><table class="lijst"><tr><th>Maand (bankdatum)</th><th class="r">Afschriften</th><th class="r">Regels</th><th class="r">Gem. dagen later</th><th class="r">Max.</th><th>Laatst ingevoerd</th></tr>${maandRijen || `<tr><td colspan="6" class="gedempt">Geen boekingen in ${jaar}.</td></tr>`}</table></div>
+
+<h2>Wanneer is er ingevoerd · laatste 60 dagen</h2>
+<p class="uitleg">Per dag dat er bankregels zijn ingevoerd: wie, hoeveel, en over welke bankdata. Een brede reeks bankdata op één dag betekent een inhaalslag.</p>
+${ritmeRijen ? `<div class="kaart schuif"><table class="lijst"><tr><th>Ingevoerd op</th><th>Gebruiker</th><th>Dagboek</th><th class="r">Afschriften</th><th class="r">Regels</th><th>Bankdata</th><th class="r">Gem. later</th><th class="r">Max.</th></tr>${ritmeRijen}</table></div>` : `<div class="leeg">Geen bankregels ingevoerd in de afgelopen 60 dagen${ritme.length === 0 && lijst.every((x) => !x.laatste_invoer) ? " (of Globe geeft geen invoermoment mee)" : ""}.</div>`}
+
+<h2>Afschriften · dagboek ${esc(gekozen!.dagboek)}</h2>
+<form class="filter" method="get">
+  <input type="hidden" name="dagboek" value="${esc(gekozen!.dagboek)}">
+  <label>Boekjaar<select name="jaar"><option value="alle"${f.jaar === undefined ? " selected" : ""}>alle</option>${jaren.map((j) => `<option${j === f.jaar ? " selected" : ""}>${j}</option>`).join("")}</select></label>
+  <label>Bankdatum van<input type="date" name="van" value="${esc(f.van ?? "")}"></label>
+  <label>tot<input type="date" name="tot" value="${esc(f.tot ?? "")}"></label>
+  <label>Gebruiker<input name="gebruiker" value="${esc(f.gebruiker ?? "")}" size="8"></label>
+  <label>Min. dagen later<input type="number" min="0" name="achter" value="${esc(f.achter ?? "")}" style="width:6rem"></label>
+  <button class="primair">Filter</button><a class="knop" href="${qs({ ...fq, formaat: "csv" })}">CSV</a>
+</form>
+<p class="sub">${getal(st.aantal)} afschriften · netto mutatie ${euro(st.mutatie)}</p>
+${stRijen ? `<div class="kaart schuif"><table class="lijst"><tr><th>Bankdatum</th><th>Boekstuk</th><th>Omschrijving</th><th class="r">Regels</th><th class="r">Ontvangen</th><th class="r">Betaald</th><th class="r">Mutatie</th><th>Ingevoerd door</th><th>Ingevoerd op</th><th class="r">Dagen later</th><th></th></tr>${stRijen}</table></div>` : `<div class="leeg">Geen afschriften met deze filters.</div>`}
+<div class="paginering"><span>${st.aantal > PAGINA ? `Afschriften ${pagina * PAGINA + 1}–${Math.min((pagina + 1) * PAGINA, st.aantal)} van ${getal(st.aantal)}` : ""}</span><span class="knoppen">${pagina > 0 ? `<a class="knop" href="${qs({ ...fq, p: pagina - 1 })}">Vorige</a>` : ""}${(pagina + 1) * PAGINA < st.aantal ? `<a class="knop" href="${qs({ ...fq, p: pagina + 1 })}">Volgende</a>` : ""}</span></div>`}`,
       ),
     );
   });
