@@ -70,6 +70,25 @@ CREATE TABLE IF NOT EXISTS globe_keyscan (
   PRIMARY KEY (scan_id, pk)
 );
 
+-- Afgeronde sleutelscans. Een herhaald laatste blok (time-out bij de agent,
+-- daarna opnieuw verstuurd) krijgt hier het eerdere resultaat terug in plaats
+-- van een tweede verwerking.
+CREATE TABLE IF NOT EXISTS globe_keyscan_klaar (
+  scan_id    text PRIMARY KEY,
+  admin_key  text NOT NULL,
+  tbl        text NOT NULL,
+  resultaat  jsonb NOT NULL,
+  afgerond   timestamptz NOT NULL DEFAULT now()
+);
+
+-- Eenmalige beheerhandelingen die via een variabele worden aangestuurd; de
+-- sleutel bevat de waarde, zodat een herstart ze niet opnieuw uitvoert.
+CREATE TABLE IF NOT EXISTS app_eenmalig (
+  sleutel    text PRIMARY KEY,
+  uitgevoerd timestamptz NOT NULL DEFAULT now(),
+  resultaat  text
+);
+
 CREATE TABLE IF NOT EXISTS globe_run (
   id          bigserial PRIMARY KEY,
   agent       text NOT NULL,

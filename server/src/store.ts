@@ -29,9 +29,13 @@ export interface TabelToestand {
   laatst_sleutelscan: string | null;
 }
 
-/** Hoeveel verwijderingen we in één sleutelscan blind toestaan. */
+/**
+ * Hoeveel verwijderingen we in één sleutelscan blind toestaan: tot 100 rijen
+ * altijd, daarboven alleen als het hooguit 2% van de tabel is. Meer wordt niet
+ * uitgevoerd maar gemeld; dan is eerder de scan verdacht dan de boekhouding.
+ */
 const MAX_VERWIJDER_ABS = 100;
-const MAX_VERWIJDER_FRACTIE = 0.2;
+const MAX_VERWIJDER_FRACTIE = 0.02;
 
 export class Store {
   readonly pool: pg.Pool;
@@ -42,13 +46,14 @@ export class Store {
     /** Tabellen die de agent niet hoeft te sturen (naam, kleine letters). */
     private readonly overslaanPatroon: RegExp | null = null,
   ) {
-    this.pool = new pg.Pool({ connectionString, max: 5 });
+    this.pool = new pg.Pool({ connectionString, max: 10 });
   }
 
   async migrate(): Promise<void> {
     const sql = readFileSync(join(here, "..", "db", "schema.sql"), "utf8");
     await this.pool.query(sql);
     await this.pool.query(`DELETE FROM globe_keyscan WHERE aangemaakt < now() - interval '1 day'`);
+    await this.pool.query(`DELETE FROM globe_keyscan_klaar WHERE afgerond < now() - interval '7 days'`);
   }
 
   /**
@@ -252,22 +257,70 @@ export class Store {
     sleutels: string[],
     laatste: boolean,
   ): Promise<{ verwijderd: number; overgeslagen?: string }> {
-    await this.pool.query(
-      `INSERT INTO globe_keyscan (scan_id, admin_key, tbl, pk)
-       SELECT $1, $2, $3, k FROM jsonb_array_elements_text($4::jsonb) k
-       ON CONFLICT DO NOTHING`,
-      [scanId, adminKey, tbl, JSON.stringify(sleutels)],
+    // Een scan die al is afgerond, verwerken we nooit opnieuw: een herhaald
+    // verzoek (time-out bij de agent) krijgt het eerdere resultaat terug.
+    const eerder = await this.pool.query<{ resultaat: { verwijderd: number; overgeslagen?: string } }>(
+      `SELECT resultaat FROM globe_keyscan_klaar WHERE scan_id = $1`,
+      [scanId],
     );
-    if (!laatste) return { verwijderd: 0 };
+    if (eerder.rows[0]) return eerder.rows[0].resultaat;
+
+    if (!laatste) {
+      await this.pool.query(
+        `INSERT INTO globe_keyscan (scan_id, admin_key, tbl, pk)
+         SELECT $1, $2, $3, k FROM jsonb_array_elements_text($4::jsonb) k
+         ON CONFLICT DO NOTHING`,
+        [scanId, adminKey, tbl, JSON.stringify(sleutels)],
+      );
+      return { verwijderd: 0 };
+    }
 
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
+      // Eén afronding per tabel tegelijk. Loopt er al een (bijvoorbeeld de
+      // eerste poging van een verzoek dat de agent opnieuw stuurde), dan
+      // wachten we niet: dat zou verbindingen vasthouden en de rest van de
+      // sync ophouden. De scan komt bij een volgende run gewoon terug.
+      const slot = await client.query<{ ok: boolean }>(
+        `SELECT pg_try_advisory_xact_lock(hashtext('keyscan'), hashtext($1 || '/' || $2)) AS ok`,
+        [adminKey, tbl],
+      );
+      if (!slot.rows[0]?.ok) {
+        await client.query("ROLLBACK");
+        return { verwijderd: 0, overgeslagen: "afronding van deze tabel loopt al — niets gedaan" };
+      }
+      // Binnen het slot opnieuw kijken: misschien rondde een gelijktijdig
+      // verzoek deze scan net af.
+      const klaar = await client.query<{ resultaat: { verwijderd: number; overgeslagen?: string } }>(
+        `SELECT resultaat FROM globe_keyscan_klaar WHERE scan_id = $1`,
+        [scanId],
+      );
+      if (klaar.rows[0]) {
+        await client.query("ROLLBACK");
+        return klaar.rows[0].resultaat;
+      }
+
+      await client.query(
+        `INSERT INTO globe_keyscan (scan_id, admin_key, tbl, pk)
+         SELECT $1, $2, $3, k FROM jsonb_array_elements_text($4::jsonb) k
+         ON CONFLICT DO NOTHING`,
+        [scanId, adminKey, tbl, JSON.stringify(sleutels)],
+      );
+
+      // De te verwijderen sleutels één keer vastleggen. Controle, historie en
+      // verwijdering werken daarna alle drie op precies deze lijst, zodat geen
+      // tussentijdse wijziging de controle kan omzeilen.
+      await client.query(
+        `CREATE TEMP TABLE weg_sleutels ON COMMIT DROP AS
+         SELECT r.pk FROM globe_row r
+          WHERE r.admin_key = $1 AND r.tbl = $2
+            AND NOT EXISTS (SELECT 1 FROM globe_keyscan k WHERE k.scan_id = $3 AND k.pk = r.pk)`,
+        [adminKey, tbl, scanId],
+      );
       const tel = await client.query<{ bestaand: string; weg: string; gescand: string }>(
         `SELECT (SELECT count(*) FROM globe_row WHERE admin_key = $1 AND tbl = $2) AS bestaand,
-                (SELECT count(*) FROM globe_row r
-                  WHERE r.admin_key = $1 AND r.tbl = $2
-                    AND NOT EXISTS (SELECT 1 FROM globe_keyscan k WHERE k.scan_id = $3 AND k.pk = r.pk)) AS weg,
+                (SELECT count(*) FROM weg_sleutels) AS weg,
                 (SELECT count(*) FROM globe_keyscan WHERE scan_id = $3) AS gescand`,
         [adminKey, tbl, scanId],
       );
@@ -284,16 +337,15 @@ export class Store {
       } else if (weg > 0) {
         await client.query(
           `INSERT INTO globe_row_historie (admin_key, tbl, pk, soort, data_oud)
-           SELECT r.admin_key, r.tbl, r.pk, 'verwijderd', r.data FROM globe_row r
-            WHERE r.admin_key = $1 AND r.tbl = $2
-              AND NOT EXISTS (SELECT 1 FROM globe_keyscan k WHERE k.scan_id = $3 AND k.pk = r.pk)`,
-          [adminKey, tbl, scanId],
+           SELECT r.admin_key, r.tbl, r.pk, 'verwijderd', r.data
+             FROM globe_row r JOIN weg_sleutels w ON w.pk = r.pk
+            WHERE r.admin_key = $1 AND r.tbl = $2`,
+          [adminKey, tbl],
         );
         const r = await client.query(
-          `DELETE FROM globe_row r
-            WHERE r.admin_key = $1 AND r.tbl = $2
-              AND NOT EXISTS (SELECT 1 FROM globe_keyscan k WHERE k.scan_id = $3 AND k.pk = r.pk)`,
-          [adminKey, tbl, scanId],
+          `DELETE FROM globe_row r USING weg_sleutels w
+            WHERE r.admin_key = $1 AND r.tbl = $2 AND r.pk = w.pk`,
+          [adminKey, tbl],
         );
         verwijderd = r.rowCount ?? 0;
       }
@@ -303,9 +355,14 @@ export class Store {
           [adminKey, tbl],
         );
       }
+      const resultaat = overgeslagen ? { verwijderd, overgeslagen } : { verwijderd };
+      await client.query(
+        `INSERT INTO globe_keyscan_klaar (scan_id, admin_key, tbl, resultaat) VALUES ($1, $2, $3, $4)`,
+        [scanId, adminKey, tbl, JSON.stringify(resultaat)],
+      );
       await client.query(`DELETE FROM globe_keyscan WHERE scan_id = $1`, [scanId]);
       await client.query("COMMIT");
-      return overgeslagen ? { verwijderd, overgeslagen } : { verwijderd };
+      return resultaat;
     } catch (e) {
       await client.query("ROLLBACK");
       throw e;

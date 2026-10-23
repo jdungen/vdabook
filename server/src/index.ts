@@ -80,6 +80,37 @@ if (process.env.OPSCHONEN_OAUTH_CLIENT) {
   console.warn(`[opschonen] ${c.rowCount} OAuth-client(s) "${process.env.OPSCHONEN_OAUTH_CLIENT}" met tokens verwijderd`);
 }
 
+// Tabellen opnieuw laten inlezen, eenmalig per waarde (een herstart doet het
+// niet nog eens):  HERINLEZEN=001:gbkmut,banktransactions;002:grtbk
+// Het watermerk gaat terug naar leeg, zodat de agent de hele tabel weer stuurt.
+// Bestaande rijen blijven staan; de sleutelscan ruimt daarna op wat echt weg is.
+if (process.env.HERINLEZEN) {
+  const waarde = process.env.HERINLEZEN.trim();
+  const sleutel = `herinlezen:${waarde}`;
+  const al = await store.pool.query(`SELECT 1 FROM app_eenmalig WHERE sleutel = $1`, [sleutel]);
+  if (al.rowCount) {
+    console.log(`[herinlezen] "${waarde}" is al eerder uitgevoerd; variabele mag weg`);
+  } else {
+    const delen: string[] = [];
+    for (const deel of waarde.split(";").map((s) => s.trim()).filter(Boolean)) {
+      const [db, lijst] = deel.split(":");
+      const tabellen = (lijst ?? "").split(",").map((t) => t.trim().toLowerCase()).filter(Boolean);
+      if (!db || !tabellen.length) continue;
+      const r = await store.pool.query(
+        `UPDATE globe_sync_state s SET watermerk = NULL, initieel_klaar = NULL
+           FROM globe_admin a
+          WHERE a.admin_key = s.admin_key AND a.database_name = $1 AND s.tbl = ANY($2)
+          RETURNING s.admin_key, s.tbl`,
+        [db.trim(), tabellen],
+      );
+      delen.push(`${db.trim()}: ${r.rows.map((x) => x.tbl).join(", ") || "geen tabellen gevonden"}`);
+    }
+    const resultaat = delen.join("; ");
+    await store.pool.query(`INSERT INTO app_eenmalig (sleutel, resultaat) VALUES ($1, $2)`, [sleutel, resultaat]);
+    console.warn(`[herinlezen] watermerk teruggezet — ${resultaat}`);
+  }
+}
+
 // Referentiecijfers uit de jaarrekeningen (JSON in de omgeving, niet in git):
 // { "<stuk bedrijfsnaam>": { "<jaar>": { "<post>": bedrag, ... }, "_bron": "..." } }
 if (process.env.JAARREKENING_REF) {
