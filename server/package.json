@@ -5,7 +5,7 @@
   "private": true,
   "type": "module",
   "engines": {
-    "node": ">=20"
+    "node": "24.x"
   },
   "scripts": {
     "build": "tsc",
@@ -21,7 +21,7 @@
   },
   "devDependencies": {
     "@types/express": "^5.0.0",
-    "@types/node": "^22.10.0",
+    "@types/node": "^24.0.0",
     "@types/pg": "^8.11.10",
     "@types/qrcode": "^1.5.5",
     "typescript": "^5.7.2"
